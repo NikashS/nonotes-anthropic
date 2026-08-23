@@ -1,43 +1,36 @@
-export type Point = { x: number; y: number }
-
-export type SceneElement = {
-  id: string
-  artifact_id: string
-  kind: 'text' | 'shape'
-  shape: 'rectangle' | 'ellipse' | 'pill' | null
-  content: string
-  x: number
-  y: number
-  width: number
-  height: number
-  style: Record<string, string>
-  revision: number
-}
-
-export type Connector = {
-  id: string
-  artifact_id: string
-  source_id: string
-  target_id: string
-  label: string | null
-  style: Record<string, string>
-}
+export type Viewport = { x: number; y: number; zoom: number }
 
 export type Artifact = {
   id: string
   title: string
   summary: string
   kind: string
+  x: number
+  y: number
+  width: number
+  height: number
+  layout: 'editorial' | 'board' | 'report'
+  accent: string
   created_at: string
   updated_at: string
+}
+
+export type ArtifactBlock = {
+  id: string
+  artifact_id: string
+  kind: 'hero' | 'rich_text' | 'process' | 'comparison' | 'timeline' | 'diagram' | 'callout' | 'metrics' | 'list'
+  variant: 'plain' | 'paper' | 'sketch' | 'ink' | 'accent' | 'quiet'
+  content: Record<string, unknown>
+  html: string
+  order: number
+  revision: number
 }
 
 export type CanvasSnapshot = {
   id: string
   name: string
   artifacts: Artifact[]
-  elements: SceneElement[]
-  connectors: Connector[]
+  blocks: ArtifactBlock[]
 }
 
 export type StreamEvent = {
@@ -49,9 +42,8 @@ export type StreamEvent = {
 
 export type InteractionContext = {
   canvas_id: string
-  viewport: { x: number; y: number; zoom: number }
+  viewport: Viewport
   focused_artifact_id?: string
-  selected_element_ids: string[]
+  focused_block_ids: string[]
   recent_focus_history: string[]
 }
-

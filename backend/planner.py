@@ -9,144 +9,63 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 try:
-    from .database import Artifact, SceneElement, retrieve_artifacts
-    from .schemas import CanvasPlan, InteractionRequest, PlanConnection, PlanElement, PlanUpdate
-except ImportError:  # Vercel Services imports the entrypoint as a top-level module.
-    from database import Artifact, SceneElement, retrieve_artifacts
-    from schemas import CanvasPlan, InteractionRequest, PlanConnection, PlanElement, PlanUpdate
+    from .database import Artifact, ArtifactBlock, retrieve_artifacts
+    from .schemas import BlockItem, CanvasPlan, InteractionRequest, PlanBlock, PlanUpdate
+except ImportError:
+    from database import Artifact, ArtifactBlock, retrieve_artifacts
+    from schemas import BlockItem, CanvasPlan, InteractionRequest, PlanBlock, PlanUpdate
 
 
-SYSTEM_PROMPT = """You are the spatial composition engine for No Notes, an AI interface without chats or threads.
-The user works on one persistent infinite canvas. The focused artifact is the default subject of pronouns like this, it, and that.
-Choose modify when changing focused content in place, extend when adding to it nearby, navigate when relevant work already exists elsewhere, and new only when the intent is genuinely separate.
-Never recreate an entire focused composition when a targeted update or a few additions are sufficient.
-Compose concise, useful answers from text chunks, rectangles, ellipses, and labeled arrows on one flat plane.
-Text elements are for prose, headings, lists, and caveats. Shape elements are semantic diagram nodes. Prefer 2-6 elements total.
-Use Markdown in element content. Existing element IDs may be used in updates, relative_to, and connector refs. Do not invent existing IDs.
-The visible result must stand alone and directly answer the user's request."""
-
+SYSTEM_PROMPT = """You are the generative composition engine for No Notes, an AI interface without chats or threads.
+The user works on one persistent spatial canvas. The focused artifact is the default subject of pronouns like this, it, and that.
+Choose modify for targeted changes to focused content, extend for additions to it, navigate when relevant work already exists, and new only for genuinely separate intent.
+Compose approachable, information-rich answers using a small vocabulary of generative UI blocks. You are not limited to diagrams: combine free text, editorial prose, comparisons, processes, timelines, metrics, callouts, and diagrams when helpful.
+Prefer 2-5 blocks. Use boxes only when grouping adds meaning. Keep most prose visually free-standing. Existing stable block IDs may be used in updates; never invent an existing ID.
+Styling is controlled by the renderer. Choose block semantics and concise content, not CSS or arbitrary HTML.
+The result must stand alone, directly answer the request, and preserve the focused artifact unless the intent is truly separate."""
 
 TOOL = {
-    "name": "render_canvas",
-    "description": "Create a validated plan of targeted edits and additions on the persistent No Notes canvas. Use existing stable element IDs for updates. New elements use short local refs which connectors can reference.",
+    "name": "compose_artifact",
+    "description": "Plan targeted edits or additions to a persistent spatial artifact using themed generative UI blocks.",
     "input_schema": CanvasPlan.model_json_schema(),
 }
 
 
 def _compact_context(session: Session, request: InteractionRequest) -> dict:
-    artifacts = retrieve_artifacts(
-        session,
-        request.context.canvas_id,
-        request.message,
-        request.context.focused_artifact_id,
-    )
+    artifacts = retrieve_artifacts(session, request.context.canvas_id, request.message, request.context.focused_artifact_id)
     result = []
     for artifact in artifacts:
-        elements = list(session.scalars(select(SceneElement).where(SceneElement.artifact_id == artifact.id)))
+        blocks = list(session.scalars(select(ArtifactBlock).where(ArtifactBlock.artifact_id == artifact.id).order_by(ArtifactBlock.order)))
         result.append({
             "id": artifact.id,
             "title": artifact.title,
             "summary": artifact.summary,
             "focused": artifact.id == request.context.focused_artifact_id,
-            "elements": [
-                {
-                    "id": item.id,
-                    "kind": item.kind,
-                    "shape": item.shape,
-                    "content": item.content[:900],
-                    "position": {"x": item.x, "y": item.y},
-                }
-                for item in elements
-            ],
+            "blocks": [{"id": block.id, "kind": block.kind, "content": block.content} for block in blocks],
         })
-    return {"artifacts": result, "selected_element_ids": request.context.selected_element_ids}
+    return {"artifacts": result, "focused_block_ids": request.context.focused_block_ids}
 
 
 async def anthropic_plan(session: Session, request: InteractionRequest) -> CanvasPlan | None:
     api_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
     if not api_key:
         return None
-
     payload = {
         "model": os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-6"),
         "max_tokens": 4096,
         "system": SYSTEM_PROMPT,
         "tools": [TOOL],
-        "tool_choice": {"type": "tool", "name": "render_canvas"},
-        "messages": [{
-            "role": "user",
-            "content": f"Request: {request.message}\n\nCanvas context:\n{json.dumps(_compact_context(session, request), ensure_ascii=False)}",
-        }],
+        "tool_choice": {"type": "tool", "name": "compose_artifact"},
+        "messages": [{"role": "user", "content": f"Request: {request.message}\n\nSpatial context:\n{json.dumps(_compact_context(session, request), ensure_ascii=False)}"}],
     }
-    headers = {
-        "x-api-key": api_key,
-        "anthropic-version": "2023-06-01",
-        "content-type": "application/json",
-    }
+    headers = {"x-api-key": api_key, "anthropic-version": "2023-06-01", "content-type": "application/json"}
     async with httpx.AsyncClient(timeout=55) as client:
         response = await client.post("https://api.anthropic.com/v1/messages", headers=headers, json=payload)
         response.raise_for_status()
     for block in response.json().get("content", []):
-        if block.get("type") == "tool_use" and block.get("name") == "render_canvas":
+        if block.get("type") == "tool_use" and block.get("name") == "compose_artifact":
             return CanvasPlan.model_validate(block["input"])
-    raise ValueError("Claude did not return a canvas plan")
-
-
-def fallback_plan(session: Session, request: InteractionRequest) -> CanvasPlan:
-    query = request.message.strip()
-    lower = query.lower()
-    focus_id = request.context.focused_artifact_id
-    focused = session.get(Artifact, focus_id) if focus_id else None
-    selected = [session.get(SceneElement, item) for item in request.context.selected_element_ids]
-    selected = [item for item in selected if item]
-    focus_elements = list(session.scalars(select(SceneElement).where(SceneElement.artifact_id == focus_id))) if focus_id else []
-
-    modify_words = ("simplify", "shorter", "rewrite", "change", "make this", "make it", "rename")
-    navigate_words = ("take me to", "go to", "show me", "where is")
-    is_modify = bool(focused and any(word in lower for word in modify_words))
-    is_navigate = any(word in lower for word in navigate_words)
-
-    if is_modify:
-        target = (selected or [item for item in focus_elements if item.kind == "text"] or focus_elements)[0]
-        return CanvasPlan(
-            mode="modify",
-            target_artifact_id=focused.id,
-            title=focused.title,
-            summary=f"Updated in place: {query}",
-            updates=[PlanUpdate(
-                element_id=target.id,
-                content=f"## {focused.title}\n{query.capitalize()}\n\nThe essential idea: your work remains on one canvas, and every follow-up changes or extends the focused material instead of starting over.",
-            )],
-        )
-
-    if is_navigate and focused:
-        return CanvasPlan(
-            mode="navigate",
-            target_artifact_id=focused.id,
-            title=focused.title,
-            summary=focused.summary,
-        )
-
-    mode = "extend" if focused else "new"
-    title = _title_from_query(query)
-    target_id = focused.id if focused else None
-    anchor = selected[0].id if selected else (focus_elements[-1].id if focus_elements else None)
-    if "privacy" in lower or "security" in lower:
-        elements = [
-            PlanElement(ref="privacy", kind="shape", shape="rectangle", content="### Privacy boundary\nPermission-filter context before retrieval and generation.", relative_to=anchor, direction="right", width=300, height=150),
-            PlanElement(ref="audit", kind="shape", shape="ellipse", content="### Legible memory\nShow sources, uncertainty, and every reversible change.", relative_to="privacy", direction="below", width=300, height=170),
-        ]
-        connections = [PlanConnection(source_ref=anchor or "privacy", target_ref="privacy", label="filters"), PlanConnection(source_ref="privacy", target_ref="audit", label="records")]
-        summary = "A privacy layer built around permission-filtered retrieval and auditable memory."
-    else:
-        elements = [
-            PlanElement(ref="answer", kind="text", content=f"## {title}\n{_answer_for(query)}", relative_to=anchor, direction="right", width=430, height=180),
-            PlanElement(ref="principle", kind="shape", shape="rectangle", content="### Continuity first\nReuse focused work, retrieve related artifacts, and create a new region only for genuinely separate intent.", relative_to="answer", direction="below", width=330, height=155),
-        ]
-        connections = [PlanConnection(source_ref="answer", target_ref="principle", label="guides")]
-        summary = _answer_for(query)
-
-    return CanvasPlan(mode=mode, target_artifact_id=target_id, title=title, summary=summary, elements=elements, connections=connections)
+    raise ValueError("Claude did not return an artifact composition")
 
 
 def _title_from_query(query: str) -> str:
@@ -155,10 +74,88 @@ def _title_from_query(query: str) -> str:
     return title[0].upper() + title[1:]
 
 
-def _answer_for(query: str) -> str:
-    if "how" in query.lower() and "no notes" in query.lower():
-        return "No Notes stores useful outcomes as durable artifacts. Each request combines explicit focus with retrieval, then modifies existing work, adds nearby material, or navigates to a related region."
-    return f"This builds on the current knowledge space in response to: **{query}**. The result stays addressable, editable, and connected to its source context."
+def _focused_blocks(session: Session, request: InteractionRequest) -> list[ArtifactBlock]:
+    ids = request.context.focused_block_ids
+    selected = [session.get(ArtifactBlock, block_id) for block_id in ids]
+    return [block for block in selected if block]
+
+
+def fallback_plan(session: Session, request: InteractionRequest) -> CanvasPlan:
+    query = request.message.strip()
+    lower = query.lower()
+    focus_id = request.context.focused_artifact_id
+    focused = session.get(Artifact, focus_id) if focus_id else None
+    focused_blocks = _focused_blocks(session, request)
+    all_blocks = list(session.scalars(select(ArtifactBlock).where(ArtifactBlock.artifact_id == focus_id).order_by(ArtifactBlock.order))) if focus_id else []
+
+    modify_words = ("simplify", "shorter", "rewrite", "change", "make this", "make it", "rename", "revise")
+    new_words = ("new topic", "separate topic", "unrelated", "start separately", "start a new")
+    navigate_words = ("take me to", "go to", "show me where", "where is")
+    is_modify = bool(focused and any(word in lower for word in modify_words))
+    is_new = not focused or any(word in lower for word in new_words)
+    new_title = _title_from_query(query)
+
+    if is_modify:
+        target = (focused_blocks or [block for block in all_blocks if block.kind in {"hero", "rich_text", "callout"}] or all_blocks)[0]
+        return CanvasPlan(
+            mode="modify",
+            target_artifact_id=focused.id,
+            title=focused.title,
+            summary=f"Updated in place: {query}",
+            updates=[PlanUpdate(
+                block_id=target.id,
+                title="The simple version",
+                body="Your useful work stays on one spatial canvas. Ask naturally; No Notes finds the relevant artifact and changes or extends it where it already lives.",
+                variant="accent",
+            )],
+        )
+
+    if focused and any(word in lower for word in navigate_words):
+        return CanvasPlan(mode="navigate", target_artifact_id=focused.id, title=focused.title, summary=focused.summary)
+
+    if "privacy" in lower or "security" in lower:
+        blocks = [
+            PlanBlock(ref="privacy", kind="diagram", title="A privacy layer around memory", body="Permission checks happen before context reaches generation.", variant="sketch", items=[
+                BlockItem(title="Your request", body="Intent and explicit focus"),
+                BlockItem(title="Permission filter", body="Identity, scope, and policy"),
+                BlockItem(title="Relevant memory", body="Only authorized artifacts"),
+                BlockItem(title="Generated answer", body="Sources and uncertainty remain visible"),
+            ]),
+            PlanBlock(ref="privacy_note", kind="callout", title="Reversible by default", body="Every model-authored change is versioned, attributable, and recoverable.", variant="ink"),
+        ]
+        summary = "Permission-filtered retrieval with legible, reversible memory."
+    elif is_new and ("japan" in lower or "trip" in lower or "travel" in lower):
+        new_title = "Two weeks in Japan"
+        blocks = [
+            PlanBlock(ref="trip_hero", kind="hero", eyebrow="A new topic", title="Two weeks in Japan", body="A paced route that gives Tokyo, Kyoto, and the mountains enough room to feel distinct.", variant="plain"),
+            PlanBlock(ref="trip_timeline", kind="timeline", title="A balanced route", variant="sketch", items=[
+                BlockItem(title="Days 1–4 · Tokyo", body="Neighborhoods, food, and one flexible day trip."),
+                BlockItem(title="Days 5–6 · Japanese Alps", body="Slow down in a mountain town or onsen."),
+                BlockItem(title="Days 7–11 · Kyoto", body="Temples early, quieter neighborhoods later."),
+                BlockItem(title="Days 12–14 · Osaka", body="Street food, design, and an easy departure."),
+            ]),
+            PlanBlock(ref="trip_note", kind="callout", title="Keep one day unplanned", body="The best itinerary leaves room to follow weather, energy, and discoveries.", variant="accent"),
+        ]
+        summary = "A balanced two-week Japan route with room for discovery."
+    else:
+        blocks = [
+            PlanBlock(ref="answer", kind="rich_text", title=_title_from_query(query), body="No Notes stores outcomes as durable artifacts. Each request combines explicit focus with retrieval, then updates the existing composition or adds the most useful material nearby.", variant="plain"),
+            PlanBlock(ref="continuity", kind="process", title="Continuity before creation", variant="sketch", items=[
+                BlockItem(title="Resolve focus", body="What is the user referring to?"),
+                BlockItem(title="Retrieve context", body="What is the smallest useful memory?"),
+                BlockItem(title="Render deliberately", body="Modify, extend, navigate, or create."),
+            ]),
+        ]
+        summary = "Focused retrieval followed by deliberate spatial composition."
+
+    return CanvasPlan(
+        mode="new" if is_new else "extend",
+        target_artifact_id=None if is_new else focused.id,
+        title=new_title if is_new else focused.title,
+        summary=summary,
+        layout="editorial",
+        blocks=blocks,
+    )
 
 
 async def make_plan(session: Session, request: InteractionRequest) -> tuple[CanvasPlan, str]:

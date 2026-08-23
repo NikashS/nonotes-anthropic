@@ -8,14 +8,6 @@ export async function loadCanvas(): Promise<CanvasSnapshot> {
   return response.json()
 }
 
-export async function updateElementPosition(id: string, x: number, y: number) {
-  await fetch(`${API_BASE}/elements/${id}/position`, {
-    method: 'PATCH',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ x, y }),
-  })
-}
-
 export async function runInteraction(
   message: string,
   context: InteractionContext,
@@ -37,18 +29,13 @@ export async function runInteraction(
   const reader = response.body.getReader()
   const decoder = new TextDecoder()
   let buffer = ''
-
   while (true) {
     const { done, value } = await reader.read()
     if (done) break
     buffer += decoder.decode(value, { stream: true })
     const lines = buffer.split('\n')
     buffer = lines.pop() ?? ''
-    for (const line of lines) {
-      if (line.trim()) onEvent(JSON.parse(line))
-    }
+    for (const line of lines) if (line.trim()) onEvent(JSON.parse(line))
   }
-
   if (buffer.trim()) onEvent(JSON.parse(buffer))
 }
-

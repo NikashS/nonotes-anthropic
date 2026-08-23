@@ -1,6 +1,6 @@
 # No Notes
 
-No Notes is a persistent, spatial AI workspace. Ask from anywhere; the system retrieves the relevant work, focuses it, and modifies or extends it in place.
+No Notes is a persistent, spatial AI workspace. Ask from anywhere; the system retrieves the relevant work and streams a themed generative document into the right place—modifying or extending existing work in place.
 
 ## Local development
 
@@ -19,5 +19,4 @@ The application works in a deterministic local mode without an API key. Add a fr
 
 ## Deployment
 
-The repository is configured as a Vercel Services project: Vite at `/` and FastAPI at `/api`. Production should use a Postgres `DATABASE_URL`; local development defaults to SQLite.
-
+The repository is configured as a Vercel Services project: Vite at `/` and FastAPI at `/api`. FastAPI compiles validated compositions into safe HTML fragments streamed over NDJSON. Production should use a Postgres `DATABASE_URL`; local development defaults to SQLite.

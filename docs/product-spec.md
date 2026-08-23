@@ -13,14 +13,16 @@ Context is stored as durable artifacts—documents, decisions, visualizations, e
 - **Solve context:** Retrieve the smallest useful set of artifacts for each request instead of loading entire histories.
 - **Artifacts over transcripts:** Preserve useful outcomes, not conversation containers.
 - **Navigation by intent:** Asking is the primary way to move through the canvas; panning and browsing are secondary.
-- **Visual when helpful:** Explain ideas with approachable notebook-style diagrams and infographics when they improve understanding.
+- **Visual when helpful:** Compose text, documents, diagrams, tables, timelines, maps, and infographics on one notebook-like surface. Visual answers are not constrained to node graphs.
 - **Legible memory:** Users can see what the AI knows, where it came from, and where its knowledge is incomplete.
 
 ## Core experience
 
 The home view is a single input over a persistent infinite canvas. It has no chat list. For each request, the system identifies relevant entities, retrieves related artifacts, resolves ambiguity, and then answers by navigating to existing material, updating it, or creating something new.
 
-Responses may be text, documents, diagrams, maps, or linked groups of artifacts. Related work is placed near each other. Follow-ups modify the current artifact, add nearby material, or shift focus to an existing related region. Starting an interaction never clears or resets the canvas.
+Responses may be text, documents, diagrams, maps, or linked groups of artifacts. Text may remain free-standing rather than being forced into containers. Related work is placed near each other. Follow-ups modify the current artifact, add nearby material, or shift focus to an existing related region. Starting an interaction never clears or resets the canvas.
+
+The visualization itself is primarily an answer, not an editor. Users navigate the canvas but do not need to arrange blocks or wire diagrams manually. When genuinely separate intent creates a new region, the current world softens and blurs while the camera moves, then resolves around the new output.
 
 ## Knowledge model
 
@@ -31,7 +33,7 @@ Interactions remain internal execution traces for recovery, provenance, and debu
 ## MVP
 
 - A single input with no chat or task list.
-- A persistent infinite canvas with text, document, and simple diagram artifacts.
+- A persistent infinite canvas with themed generative text, document, data, and visualization artifacts.
 - Automatic artifact extraction and retrieval.
 - Basic entity and relationship linking.
 - Natural-language navigation to existing canvas regions.
@@ -39,4 +41,3 @@ Interactions remain internal execution traces for recovery, provenance, and debu
 - Provenance, revision history, and user correction.
 
 No Notes succeeds when users stop thinking in conversations and simply ask for their work, trusting the system to recover the right context and present it in a form they can understand and continue.
-

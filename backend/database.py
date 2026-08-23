@@ -42,6 +42,29 @@ class Artifact(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
 
+class ArtifactRegion(Base):
+    __tablename__ = "artifact_regions"
+    artifact_id: Mapped[str] = mapped_column(ForeignKey("artifacts.id"), primary_key=True)
+    x: Mapped[float] = mapped_column(Float, default=0)
+    y: Mapped[float] = mapped_column(Float, default=0)
+    width: Mapped[float] = mapped_column(Float, default=960)
+    height: Mapped[float] = mapped_column(Float, default=680)
+    layout: Mapped[str] = mapped_column(String(40), default="editorial")
+    accent: Mapped[str] = mapped_column(String(40), default="moss")
+
+
+class ArtifactBlock(Base):
+    __tablename__ = "artifact_blocks"
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    artifact_id: Mapped[str] = mapped_column(ForeignKey("artifacts.id"), index=True)
+    kind: Mapped[str] = mapped_column(String(40))
+    variant: Mapped[str] = mapped_column(String(40), default="plain")
+    content: Mapped[dict] = mapped_column(JSON, default=dict)
+    html: Mapped[str] = mapped_column(Text, default="")
+    order: Mapped[int] = mapped_column(Integer, default=0)
+    revision: Mapped[int] = mapped_column(Integer, default=1)
+
+
 class ArtifactRevision(Base):
     __tablename__ = "artifact_revisions"
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
@@ -50,31 +73,6 @@ class ArtifactRevision(Base):
     number: Mapped[int] = mapped_column(Integer)
     snapshot: Mapped[dict] = mapped_column(JSON)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
-
-
-class SceneElement(Base):
-    __tablename__ = "scene_elements"
-    id: Mapped[str] = mapped_column(String(64), primary_key=True)
-    artifact_id: Mapped[str] = mapped_column(ForeignKey("artifacts.id"), index=True)
-    kind: Mapped[str] = mapped_column(String(30))
-    shape: Mapped[str | None] = mapped_column(String(30), nullable=True)
-    content: Mapped[str] = mapped_column(Text, default="")
-    x: Mapped[float] = mapped_column(Float)
-    y: Mapped[float] = mapped_column(Float)
-    width: Mapped[float] = mapped_column(Float)
-    height: Mapped[float] = mapped_column(Float)
-    style: Mapped[dict] = mapped_column(JSON, default=dict)
-    revision: Mapped[int] = mapped_column(Integer, default=1)
-
-
-class Connector(Base):
-    __tablename__ = "connectors"
-    id: Mapped[str] = mapped_column(String(64), primary_key=True)
-    artifact_id: Mapped[str] = mapped_column(ForeignKey("artifacts.id"), index=True)
-    source_id: Mapped[str] = mapped_column(ForeignKey("scene_elements.id"))
-    target_id: Mapped[str] = mapped_column(ForeignKey("scene_elements.id"))
-    label: Mapped[str | None] = mapped_column(String(200), nullable=True)
-    style: Mapped[dict] = mapped_column(JSON, default=dict)
 
 
 class Relationship(Base):
@@ -111,70 +109,41 @@ connect_args = {"check_same_thread": False} if database_url.startswith("sqlite")
 engine = create_engine(database_url, pool_pre_ping=True, connect_args=connect_args)
 
 
-def init_database() -> None:
-    Base.metadata.create_all(engine)
-    with Session(engine) as session:
-        if session.get(Canvas, "main"):
-            return
-        canvas = Canvas(id="main", name="My knowledge space")
-        artifact = Artifact(
-            id="artifact_no_notes",
-            canvas_id="main",
-            title="The No Notes idea",
-            summary="A spatial AI workspace that retrieves durable artifacts instead of asking users to find old chats.",
-        )
-        elements = [
-            SceneElement(id="element_vision", artifact_id=artifact.id, kind="text", content="# No Notes\nAsk for what you remember. The system finds the right work and continues it **in place**.", x=20, y=20, width=480, height=150, style={}),
-            SceneElement(id="element_artifacts", artifact_id=artifact.id, kind="shape", shape="rectangle", content="### Durable artifacts\nDocuments, decisions, entities, and visualizations—not chat transcripts.", x=20, y=245, width=280, height=150, style={}),
-            SceneElement(id="element_retrieve", artifact_id=artifact.id, kind="shape", shape="rectangle", content="### Retrieve context\nSelect the smallest useful set of related artifacts.", x=400, y=245, width=280, height=150, style={}),
-            SceneElement(id="element_continue", artifact_id=artifact.id, kind="shape", shape="ellipse", content="### Continue the work\nModify, extend, or navigate.", x=780, y=235, width=270, height=170, style={}),
-            SceneElement(id="element_principle", artifact_id=artifact.id, kind="text", content="The canvas is persistent. A follow-up should build on the focused output unless the intent is genuinely separate.", x=400, y=475, width=430, height=110, style={}),
-        ]
-        connectors = [
-            Connector(id="connector_1", artifact_id=artifact.id, source_id="element_artifacts", target_id="element_retrieve", label="becomes searchable", style={}),
-            Connector(id="connector_2", artifact_id=artifact.id, source_id="element_retrieve", target_id="element_continue", label="restores context", style={}),
-        ]
-        session.add_all([canvas, artifact, *elements, *connectors])
-        session.commit()
-        write_revision(session, artifact.id, None)
-        session.commit()
-
-
-def serialize_element(element: SceneElement) -> dict:
+def serialize_region(region: ArtifactRegion) -> dict:
     return {
-        "id": element.id,
-        "artifact_id": element.artifact_id,
-        "kind": element.kind,
-        "shape": element.shape,
-        "content": element.content,
-        "x": element.x,
-        "y": element.y,
-        "width": element.width,
-        "height": element.height,
-        "style": element.style or {},
-        "revision": element.revision,
+        "x": region.x,
+        "y": region.y,
+        "width": region.width,
+        "height": region.height,
+        "layout": region.layout,
+        "accent": region.accent,
     }
 
 
-def serialize_connector(connector: Connector) -> dict:
-    return {
-        "id": connector.id,
-        "artifact_id": connector.artifact_id,
-        "source_id": connector.source_id,
-        "target_id": connector.target_id,
-        "label": connector.label,
-        "style": connector.style or {},
-    }
-
-
-def serialize_artifact(artifact: Artifact) -> dict:
-    return {
+def serialize_artifact(artifact: Artifact, region: ArtifactRegion | None = None) -> dict:
+    result = {
         "id": artifact.id,
         "title": artifact.title,
         "summary": artifact.summary,
         "kind": artifact.kind,
         "created_at": artifact.created_at.isoformat(),
         "updated_at": artifact.updated_at.isoformat(),
+    }
+    if region:
+        result.update(serialize_region(region))
+    return result
+
+
+def serialize_block(block: ArtifactBlock) -> dict:
+    return {
+        "id": block.id,
+        "artifact_id": block.artifact_id,
+        "kind": block.kind,
+        "variant": block.variant,
+        "content": block.content or {},
+        "html": block.html,
+        "order": block.order,
+        "revision": block.revision,
     }
 
 
@@ -186,32 +155,27 @@ def canvas_snapshot(session: Session, canvas_id: str = "main") -> dict:
         session.commit()
     artifacts = list(session.scalars(select(Artifact).where(Artifact.canvas_id == canvas_id)))
     artifact_ids = [artifact.id for artifact in artifacts]
-    elements = list(session.scalars(select(SceneElement).where(SceneElement.artifact_id.in_(artifact_ids)))) if artifact_ids else []
-    connectors = list(session.scalars(select(Connector).where(Connector.artifact_id.in_(artifact_ids)))) if artifact_ids else []
+    regions = list(session.scalars(select(ArtifactRegion).where(ArtifactRegion.artifact_id.in_(artifact_ids)))) if artifact_ids else []
+    region_map = {region.artifact_id: region for region in regions}
+    blocks = list(session.scalars(select(ArtifactBlock).where(ArtifactBlock.artifact_id.in_(artifact_ids)).order_by(ArtifactBlock.order))) if artifact_ids else []
     return {
         "id": canvas.id,
         "name": canvas.name,
-        "artifacts": [serialize_artifact(item) for item in artifacts],
-        "elements": [serialize_element(item) for item in elements],
-        "connectors": [serialize_connector(item) for item in connectors],
+        "artifacts": [serialize_artifact(item, region_map.get(item.id)) for item in artifacts],
+        "blocks": [serialize_block(item) for item in blocks],
     }
 
 
 def write_revision(session: Session, artifact_id: str, run_id: str | None) -> None:
-    elements = list(session.scalars(select(SceneElement).where(SceneElement.artifact_id == artifact_id)))
-    connectors = list(session.scalars(select(Connector).where(Connector.artifact_id == artifact_id)))
-    latest = session.scalars(
-        select(ArtifactRevision).where(ArtifactRevision.artifact_id == artifact_id).order_by(ArtifactRevision.number.desc())
-    ).first()
+    blocks = list(session.scalars(select(ArtifactBlock).where(ArtifactBlock.artifact_id == artifact_id).order_by(ArtifactBlock.order)))
+    region = session.get(ArtifactRegion, artifact_id)
+    latest = session.scalars(select(ArtifactRevision).where(ArtifactRevision.artifact_id == artifact_id).order_by(ArtifactRevision.number.desc())).first()
     session.add(ArtifactRevision(
         id=new_id("revision"),
         artifact_id=artifact_id,
         run_id=run_id,
         number=(latest.number + 1) if latest else 1,
-        snapshot={
-            "elements": [serialize_element(item) for item in elements],
-            "connectors": [serialize_connector(item) for item in connectors],
-        },
+        snapshot={"region": serialize_region(region) if region else None, "blocks": [serialize_block(item) for item in blocks]},
     ))
 
 
@@ -221,11 +185,49 @@ def retrieve_artifacts(session: Session, canvas_id: str, query: str, focused_art
 
     def score(artifact: Artifact) -> float:
         haystack = f"{artifact.title} {artifact.summary}".lower()
-        lexical = sum(1.0 for term in terms if term in haystack)
-        focus = 8.0 if artifact.id == focused_artifact_id else 0.0
-        return lexical + focus
+        return sum(1.0 for term in terms if term in haystack) + (8.0 if artifact.id == focused_artifact_id else 0.0)
 
     return sorted(artifacts, key=score, reverse=True)[:limit]
+
+
+def init_database() -> None:
+    Base.metadata.create_all(engine)
+    with Session(engine) as session:
+        canvas = session.get(Canvas, "main")
+        if not canvas:
+            canvas = Canvas(id="main", name="My knowledge space")
+            session.add(canvas)
+        artifact = session.get(Artifact, "artifact_no_notes")
+        if not artifact:
+            artifact = Artifact(
+                id="artifact_no_notes",
+                canvas_id="main",
+                title="The No Notes idea",
+                summary="A spatial AI workspace that retrieves durable artifacts instead of asking users to find old chats.",
+            )
+            session.add(artifact)
+        region = session.get(ArtifactRegion, artifact.id)
+        if not region:
+            session.add(ArtifactRegion(artifact_id=artifact.id, x=40, y=20, width=1040, height=900, layout="editorial", accent="moss"))
+        else:
+            region.height = max(region.height, 900)
+        has_blocks = session.scalars(select(ArtifactBlock).where(ArtifactBlock.artifact_id == artifact.id)).first()
+        if not has_blocks:
+            seed_blocks = [
+                ArtifactBlock(id="block_vision", artifact_id=artifact.id, kind="hero", variant="plain", order=0, content={"eyebrow": "A spatial AI workspace", "title": "No Notes", "body": "Ask for what you remember. The system finds the right work and continues it in place."}, html="<p class=\"eyebrow\">A spatial AI workspace</p><h1>No Notes</h1><p class=\"lede\">Ask for what you remember. The system finds the right work and continues it <strong>in place</strong>.</p>"),
+                ArtifactBlock(id="block_flow", artifact_id=artifact.id, kind="process", variant="sketch", order=1, content={"title": "From memory to momentum", "items": [{"title": "Ask naturally", "body": ""}, {"title": "Retrieve durable artifacts", "body": ""}, {"title": "Continue the work", "body": ""}]}, html="<h2>From memory to momentum</h2><div class=\"process-line\"><div><strong>Ask naturally</strong></div><i></i><div><strong>Retrieve durable artifacts</strong></div><i></i><div><strong>Continue the work</strong></div></div>"),
+                ArtifactBlock(id="block_principles", artifact_id=artifact.id, kind="comparison", variant="paper", order=2, content={"title": "The interaction model", "items": ["No chats to find|Intent is the navigation", "No blank canvas on follow-up|Focused work changes in place", "No diagram-only answers|Text, visuals, tables, and documents coexist"]}, html="<h2>The interaction model</h2><div class=\"comparison-grid\"><article><small>Instead of</small><strong>No chats to find</strong><p>Intent is the navigation.</p></article><article><small>Continuity</small><strong>No blank canvas on follow-up</strong><p>Focused work changes in place.</p></article><article><small>Expression</small><strong>No diagram-only answers</strong><p>Text, visuals, tables, and documents coexist.</p></article></div>"),
+                ArtifactBlock(id="block_note", artifact_id=artifact.id, kind="callout", variant="ink", order=3, content={"title": "The invariant", "body": "A follow-up modifies or extends the focused artifact. Only genuinely separate intent creates a new spatial region."}, html="<span class=\"scribble\">The invariant</span><p>A follow-up modifies or extends the focused artifact. Only genuinely separate intent creates a new spatial region.</p>"),
+            ]
+            session.add_all(seed_blocks)
+        else:
+            flow = session.get(ArtifactBlock, "block_flow")
+            if flow and "<span>" in flow.html:
+                flow.html = "<h2>From memory to momentum</h2><div class=\"process-line\"><div><strong>Ask naturally</strong></div><i></i><div><strong>Retrieve durable artifacts</strong></div><i></i><div><strong>Continue the work</strong></div></div>"
+        session.commit()
+        if not session.scalars(select(ArtifactRevision).where(ArtifactRevision.artifact_id == artifact.id)).first():
+            write_revision(session, artifact.id, None)
+            session.commit()
 
 
 init_database()

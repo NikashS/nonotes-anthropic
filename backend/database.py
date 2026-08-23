@@ -6,8 +6,9 @@ from pathlib import Path
 from uuid import uuid4
 
 from dotenv import load_dotenv
-from sqlalchemy import JSON, DateTime, Float, ForeignKey, Integer, String, Text, create_engine, select
+from sqlalchemy import JSON, DateTime, Float, ForeignKey, Index, Integer, String, Text, create_engine, select
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column
+from sqlalchemy.pool import NullPool
 
 load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
@@ -55,8 +56,9 @@ class ArtifactRegion(Base):
 
 class ArtifactBlock(Base):
     __tablename__ = "artifact_blocks"
+    __table_args__ = (Index("ix_artifact_blocks_artifact_order", "artifact_id", "order"),)
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
-    artifact_id: Mapped[str] = mapped_column(ForeignKey("artifacts.id"), index=True)
+    artifact_id: Mapped[str] = mapped_column(ForeignKey("artifacts.id"))
     kind: Mapped[str] = mapped_column(String(40))
     variant: Mapped[str] = mapped_column(String(40), default="plain")
     content: Mapped[dict] = mapped_column(JSON, default=dict)
@@ -67,8 +69,9 @@ class ArtifactBlock(Base):
 
 class ArtifactRevision(Base):
     __tablename__ = "artifact_revisions"
+    __table_args__ = (Index("ix_artifact_revisions_artifact_number", "artifact_id", "number"),)
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
-    artifact_id: Mapped[str] = mapped_column(ForeignKey("artifacts.id"), index=True)
+    artifact_id: Mapped[str] = mapped_column(ForeignKey("artifacts.id"))
     run_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     number: Mapped[int] = mapped_column(Integer)
     snapshot: Mapped[dict] = mapped_column(JSON)
@@ -105,8 +108,13 @@ if database_url.startswith("postgres://"):
 elif database_url.startswith("postgresql://"):
     database_url = database_url.replace("postgresql://", "postgresql+psycopg://", 1)
 
-connect_args = {"check_same_thread": False} if database_url.startswith("sqlite") else {}
-engine = create_engine(database_url, pool_pre_ping=True, connect_args=connect_args)
+if database_url.startswith("sqlite"):
+    engine = create_engine(database_url, pool_pre_ping=True, connect_args={"check_same_thread": False})
+else:
+    # Vercel instances are transient. Let Supavisor own connection pooling and
+    # disable prepared statements, which transaction-pooling mode cannot retain.
+    connect_args = {"prepare_threshold": None} if ":6543/" in database_url else {}
+    engine = create_engine(database_url, pool_pre_ping=True, poolclass=NullPool, connect_args=connect_args)
 
 
 def serialize_region(region: ArtifactRegion) -> dict:
@@ -202,10 +210,13 @@ def init_database() -> None:
             artifact = Artifact(
                 id="artifact_no_notes",
                 canvas_id="main",
+                kind="welcome",
                 title="The No Notes idea",
                 summary="A spatial AI workspace that retrieves durable artifacts instead of asking users to find old chats.",
             )
             session.add(artifact)
+        elif artifact.kind != "welcome":
+            artifact.kind = "welcome"
         region = session.get(ArtifactRegion, artifact.id)
         if not region:
             session.add(ArtifactRegion(artifact_id=artifact.id, x=40, y=20, width=1040, height=900, layout="editorial", accent="moss"))

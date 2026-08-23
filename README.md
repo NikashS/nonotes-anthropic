@@ -15,8 +15,8 @@ pnpm --dir frontend install
 pnpm --dir frontend dev
 ```
 
-The application works in a deterministic local mode without an API key. Add a fresh `ANTHROPIC_API_KEY` to `.env` to enable Claude-generated compositions.
+The application works in a deterministic local mode without an API key. Add a fresh `ANTHROPIC_API_KEY` to `.env` to enable Claude-generated compositions. Keep real credentials out of Git.
 
 ## Deployment
 
-The repository is configured as a Vercel Services project: Vite at `/` and FastAPI at `/api`. FastAPI compiles validated compositions into safe HTML fragments streamed over NDJSON. Production should use a Postgres `DATABASE_URL`; local development defaults to SQLite.
+The repository is configured as a Vercel Services project: Vite at `/` and FastAPI at `/api`. FastAPI compiles validated compositions into safe HTML fragments streamed over NDJSON. Production uses a Supabase Postgres transaction-pooler `DATABASE_URL`; local development defaults to SQLite. Vercel production variables are intentionally scoped to Production and must be set before redeploying.

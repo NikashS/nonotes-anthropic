@@ -22,6 +22,8 @@ The home view is a single input over a persistent infinite canvas. It has no cha
 
 Responses may be text, documents, diagrams, maps, or linked groups of artifacts. Text may remain free-standing rather than being forced into containers. Related work is placed near each other. Follow-ups modify the current artifact, add nearby material, or shift focus to an existing related region. Starting an interaction never clears or resets the canvas.
 
+The welcome composition introduces the product but is not itself a topic. A first substantive question opens a dedicated region for that exploration. Thereafter, referential follow-ups build on the focused region, while a self-contained change of subject gets its own region and a blur → move → reveal transition.
+
 The visualization itself is primarily an answer, not an editor. Users navigate the canvas but do not need to arrange blocks or wire diagrams manually. When genuinely separate intent creates a new region, the current world softens and blurs while the camera moves, then resolves around the new output.
 
 ## Knowledge model

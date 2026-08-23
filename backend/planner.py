@@ -18,7 +18,8 @@ except ImportError:
 
 SYSTEM_PROMPT = """You are the generative composition engine for No Notes, an AI interface without chats or threads.
 The user works on one persistent spatial canvas. The focused artifact is the default subject of pronouns like this, it, and that.
-Choose modify for targeted changes to focused content, extend for additions to it, navigate when relevant work already exists, and new only for genuinely separate intent.
+An artifact with kind `welcome` is orientation, never the user's working topic. Any substantive request while it is focused MUST create a new artifact in a separate region.
+For other artifacts, choose modify or extend only when the request refers to the focused work (for example: this, that, it, add, revise, continue, go deeper, or what about). A self-contained request that introduces its own subject creates a new artifact even if something is focused. Choose navigate when the request asks to revisit relevant existing work.
 Compose approachable, information-rich answers using a small vocabulary of generative UI blocks. You are not limited to diagrams: combine free text, editorial prose, comparisons, processes, timelines, metrics, callouts, and diagrams when helpful.
 Prefer 2-5 blocks. Use boxes only when grouping adds meaning. Keep most prose visually free-standing. Existing stable block IDs may be used in updates; never invent an existing ID.
 Styling is controlled by the renderer. Choose block semantics and concise content, not CSS or arbitrary HTML.
@@ -40,6 +41,7 @@ def _compact_context(session: Session, request: InteractionRequest) -> dict:
             "id": artifact.id,
             "title": artifact.title,
             "summary": artifact.summary,
+            "kind": artifact.kind,
             "focused": artifact.id == request.context.focused_artifact_id,
             "blocks": [{"id": block.id, "kind": block.kind, "content": block.content} for block in blocks],
         })
@@ -80,6 +82,16 @@ def _focused_blocks(session: Session, request: InteractionRequest) -> list[Artif
     return [block for block in selected if block]
 
 
+def _has_continuation_cue(query: str) -> bool:
+    patterns = (
+        r"\b(this|that|it|these|those)\b",
+        r"\b(add|append|include|expand|extend|continue|revise|rewrite|simplify|shorten|change|rename)\b",
+        r"\b(go deeper|more on|build on|what about|turn this|visualize this|make this|make it)\b",
+        r"^(and|also|but)\b",
+    )
+    return any(re.search(pattern, query, re.IGNORECASE) for pattern in patterns)
+
+
 def fallback_plan(session: Session, request: InteractionRequest) -> CanvasPlan:
     query = request.message.strip()
     lower = query.lower()
@@ -91,8 +103,9 @@ def fallback_plan(session: Session, request: InteractionRequest) -> CanvasPlan:
     modify_words = ("simplify", "shorter", "rewrite", "change", "make this", "make it", "rename", "revise")
     new_words = ("new topic", "separate topic", "unrelated", "start separately", "start a new")
     navigate_words = ("take me to", "go to", "show me where", "where is")
-    is_modify = bool(focused and any(word in lower for word in modify_words))
-    is_new = not focused or any(word in lower for word in new_words)
+    can_continue = bool(focused and focused.kind != "welcome")
+    is_modify = bool(can_continue and any(word in lower for word in modify_words))
+    is_new = not can_continue or any(word in lower for word in new_words) or not _has_continuation_cue(query)
     new_title = _title_from_query(query)
 
     if is_modify:
@@ -162,6 +175,11 @@ async def make_plan(session: Session, request: InteractionRequest) -> tuple[Canv
     try:
         plan = await anthropic_plan(session, request)
         if plan:
+            focused = session.get(Artifact, request.context.focused_artifact_id) if request.context.focused_artifact_id else None
+            # Keep the product introduction pristine even if a model mistakes
+            # visual focus for conversational continuity.
+            if focused and focused.kind == "welcome" and plan.mode != "new":
+                return fallback_plan(session, request), "local"
             return plan, "claude"
     except (httpx.HTTPError, ValueError):
         if os.getenv("NONOTES_STRICT_MODEL") == "1":

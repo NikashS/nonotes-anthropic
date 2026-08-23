@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 
@@ -30,6 +31,8 @@ TOOL = {
     "description": "Plan targeted edits or additions to a persistent spatial artifact using themed generative UI blocks.",
     "input_schema": CanvasPlan.model_json_schema(),
 }
+
+logger = logging.getLogger(__name__)
 
 
 def _compact_context(session: Session, request: InteractionRequest) -> dict:
@@ -177,11 +180,13 @@ async def make_plan(session: Session, request: InteractionRequest) -> tuple[Canv
         if plan:
             focused = session.get(Artifact, request.context.focused_artifact_id) if request.context.focused_artifact_id else None
             # Keep the product introduction pristine even if a model mistakes
-            # visual focus for conversational continuity.
+            # visual focus for conversational continuity. Preserve the useful
+            # generated composition while overriding only its spatial intent.
             if focused and focused.kind == "welcome" and plan.mode != "new":
-                return fallback_plan(session, request), "local"
+                plan = plan.model_copy(update={"mode": "new", "target_artifact_id": None, "updates": []})
             return plan, "claude"
-    except (httpx.HTTPError, ValueError):
+    except (httpx.HTTPError, ValueError) as exc:
+        logger.warning("Anthropic planner unavailable: %s", type(exc).__name__)
         if os.getenv("NONOTES_STRICT_MODEL") == "1":
             raise
     return fallback_plan(session, request), "local"

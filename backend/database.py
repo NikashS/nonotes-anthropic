@@ -227,7 +227,7 @@ def init_database() -> None:
             seed_blocks = [
                 ArtifactBlock(id="block_vision", artifact_id=artifact.id, kind="hero", variant="plain", order=0, content={"eyebrow": "A spatial AI workspace", "title": "No Notes", "body": "Ask for what you remember. The system finds the right work and continues it in place."}, html="<p class=\"eyebrow\">A spatial AI workspace</p><h1>No Notes</h1><p class=\"lede\">Ask for what you remember. The system finds the right work and continues it <strong>in place</strong>.</p>"),
                 ArtifactBlock(id="block_flow", artifact_id=artifact.id, kind="process", variant="sketch", order=1, content={"title": "From memory to momentum", "items": [{"title": "Ask naturally", "body": ""}, {"title": "Retrieve durable artifacts", "body": ""}, {"title": "Continue the work", "body": ""}]}, html="<h2>From memory to momentum</h2><div class=\"process-line\"><div><strong>Ask naturally</strong></div><i></i><div><strong>Retrieve durable artifacts</strong></div><i></i><div><strong>Continue the work</strong></div></div>"),
-                ArtifactBlock(id="block_principles", artifact_id=artifact.id, kind="comparison", variant="paper", order=2, content={"title": "The interaction model", "items": ["No chats to find|Intent is the navigation", "No blank canvas on follow-up|Focused work changes in place", "No diagram-only answers|Text, visuals, tables, and documents coexist"]}, html="<h2>The interaction model</h2><div class=\"comparison-grid\"><article><small>Instead of</small><strong>No chats to find</strong><p>Intent is the navigation.</p></article><article><small>Continuity</small><strong>No blank canvas on follow-up</strong><p>Focused work changes in place.</p></article><article><small>Expression</small><strong>No diagram-only answers</strong><p>Text, visuals, tables, and documents coexist.</p></article></div>"),
+                ArtifactBlock(id="block_principles", artifact_id=artifact.id, kind="comparison", variant="paper", order=2, content={"title": "The interaction model", "items": [{"label": "Instead of", "title": "No chats to find", "body": "Intent is the navigation."}, {"label": "Continuity", "title": "No blank canvas on follow-up", "body": "Focused work changes in place."}, {"label": "Expression", "title": "No diagram-only answers", "body": "Text, visuals, tables, and documents coexist."}]}, html="<h2>The interaction model</h2><div class=\"comparison-grid\"><article><small>Instead of</small><strong>No chats to find</strong><p>Intent is the navigation.</p></article><article><small>Continuity</small><strong>No blank canvas on follow-up</strong><p>Focused work changes in place.</p></article><article><small>Expression</small><strong>No diagram-only answers</strong><p>Text, visuals, tables, and documents coexist.</p></article></div>"),
                 ArtifactBlock(id="block_note", artifact_id=artifact.id, kind="callout", variant="ink", order=3, content={"title": "The invariant", "body": "A follow-up modifies or extends the focused artifact. Only genuinely separate intent creates a new spatial region."}, html="<span class=\"scribble\">The invariant</span><p>A follow-up modifies or extends the focused artifact. Only genuinely separate intent creates a new spatial region.</p>"),
             ]
             session.add_all(seed_blocks)
@@ -235,6 +235,16 @@ def init_database() -> None:
             flow = session.get(ArtifactBlock, "block_flow")
             if flow and "<span>" in flow.html:
                 flow.html = "<h2>From memory to momentum</h2><div class=\"process-line\"><div><strong>Ask naturally</strong></div><i></i><div><strong>Retrieve durable artifacts</strong></div><i></i><div><strong>Continue the work</strong></div></div>"
+            principles = session.get(ArtifactBlock, "block_principles")
+            if principles and any(isinstance(item, str) for item in (principles.content or {}).get("items", [])):
+                principles.content = {
+                    "title": "The interaction model",
+                    "items": [
+                        {"label": "Instead of", "title": "No chats to find", "body": "Intent is the navigation."},
+                        {"label": "Continuity", "title": "No blank canvas on follow-up", "body": "Focused work changes in place."},
+                        {"label": "Expression", "title": "No diagram-only answers", "body": "Text, visuals, tables, and documents coexist."},
+                    ],
+                }
         session.commit()
         if not session.scalars(select(ArtifactRevision).where(ArtifactRevision.artifact_id == artifact.id)).first():
             write_revision(session, artifact.id, None)

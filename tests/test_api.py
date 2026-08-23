@@ -8,6 +8,7 @@ from fastapi.testclient import TestClient
 os.environ["DATABASE_URL"] = f"sqlite:////tmp/nonotes-test-{uuid4().hex}.db"
 
 from backend.main import app
+from backend.planner import _validate_plan_input
 
 client = TestClient(app)
 
@@ -37,6 +38,21 @@ def test_canvas_is_seeded_with_generative_blocks() -> None:
     assert {block["kind"] for block in body["blocks"]} >= {"hero", "process", "comparison", "callout"}
     assert all("html" in block for block in body["blocks"])
     assert body["artifacts"][0]["kind"] == "welcome"
+
+
+def test_legacy_comparison_rows_are_normalized_for_model_output() -> None:
+    plan = _validate_plan_input({
+        "mode": "new",
+        "title": "Database tradeoffs",
+        "summary": "A comparison",
+        "blocks": [{
+            "ref": "comparison",
+            "kind": "comparison",
+            "items": ["Relational|Document", "Strong joins|Flexible shape"],
+        }],
+    })
+    assert plan.blocks[0].items[1].title == "Strong joins"
+    assert plan.blocks[0].items[1].body == "Flexible shape"
 
 
 def test_first_question_leaves_welcome_and_uses_a_new_region() -> None:

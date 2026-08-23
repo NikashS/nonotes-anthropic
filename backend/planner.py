@@ -69,8 +69,22 @@ async def anthropic_plan(session: Session, request: InteractionRequest) -> Canva
         response.raise_for_status()
     for block in response.json().get("content", []):
         if block.get("type") == "tool_use" and block.get("name") == "compose_artifact":
-            return CanvasPlan.model_validate(block["input"])
+            return _validate_plan_input(block["input"])
     raise ValueError("Claude did not return an artifact composition")
+
+
+def _validate_plan_input(raw: dict) -> CanvasPlan:
+    """Accept the compact pipe-delimited rows used by older persisted blocks."""
+    for collection in (raw.get("blocks", []), raw.get("updates", [])):
+        for block in collection:
+            items = block.get("items", [])
+            block["items"] = [
+                {"title": parts[0].strip(), "body": " · ".join(part.strip() for part in parts[1:])}
+                if isinstance(item, str) and (parts := item.split("|"))
+                else item
+                for item in items
+            ]
+    return CanvasPlan.model_validate(raw)
 
 
 def _title_from_query(query: str) -> str:

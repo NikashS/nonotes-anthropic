@@ -27,7 +27,7 @@ except ImportError:
 
 
 OUTLINE_PROMPT = """You are the spatial editor for No Notes. Decide where an answer belongs, then return only a compact visual outline.
-The outline is a space contract: choose 3-5 complementary blocks, their order, expected item counts, and size before content is written.
+The outline is a space contract: choose 3-4 complementary blocks, their order, expected item counts, and size before content is written. Never create five blocks; combine adjacent ideas instead.
 Use free-standing hero or rich text for explanation. Use a diagram, process, comparison, timeline, or metrics block only when it clarifies a relationship.
 Prefer varied, whiteboard-like compositions over uniform card grids. Keep item_count at 3-5 for visual blocks and zero for prose or callouts.
 Use `large` for heroes and dense timelines/diagrams, `compact` for callouts, and `standard` otherwise.
@@ -147,7 +147,12 @@ async def anthropic_outline(session: Session, request: InteractionRequest) -> tu
         900,
         14,
     )
-    return CanvasOutline.model_validate(raw), context_data
+    outline = CanvasOutline.model_validate(raw)
+    updates = outline.updates[:4]
+    blocks = outline.blocks[:max(0, 4 - len(updates))]
+    if updates != outline.updates or blocks != outline.blocks:
+        outline = outline.model_copy(update={"updates": updates, "blocks": blocks})
+    return outline, context_data
 
 
 def _outline_from_plan(session: Session, plan: CanvasPlan) -> tuple[CanvasOutline, dict[str, PlanBlock]]:
@@ -228,7 +233,7 @@ For diagrams and processes, each item is a node or step. For comparisons, each i
         ],
     }, ensure_ascii=False)
     try:
-        raw = await _call_tool(system, CONTENT_TOOL, prompt, min(2600, 500 + len(slots) * 420), 26)
+        raw = await _call_tool(system, CONTENT_TOOL, prompt, min(1800, 420 + len(slots) * 340), 22)
         batch = GeneratedBlockBatch.model_validate(raw)
         generated = {item.ref: item.content for item in batch.blocks}
     except (httpx.HTTPError, ValueError) as exc:

@@ -53,3 +53,10 @@ Follow-ups patch stable block IDs or append new blocks to the focused artifact. 
 Claude is forced to call a validated `compose_artifact` tool. Its result contains intent mode, targeted block updates, new semantic blocks, and layout hints. The backend owns stable IDs, placement, HTML compilation, validation, sequencing, revisions, and commits.
 
 Without a configured Anthropic key, a deterministic planner exercises the same composition and streaming contracts for local development and automated tests.
+# Semantic continuity
+
+Artifacts are indexed in the existing Supabase Postgres database with `pgvector`. A Supabase Edge Function runs the native `gte-small` model, so query and artifact embeddings use one normalized 384-dimensional space without an additional model credential.
+
+Retrieval is hybrid: cosine similarity is the primary signal, while lexical overlap and current focus are small tie-breakers. Claude receives the ranked candidates and chooses whether to modify, extend, navigate to, or create an artifact. Focus resolves references; it does not limit retrieval. Completed artifacts are re-embedded from their title, summary, and block content.
+
+The renderer uses semantic block types, but layout is intrinsic. Compositions and their children wrap using readable minimum widths instead of fixed column counts; connectors are decorative and never occupy content cells.

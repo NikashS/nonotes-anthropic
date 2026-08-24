@@ -11,12 +11,14 @@ from sqlalchemy.orm import Session
 
 try:
     from .database import Artifact, ArtifactBlock, retrieve_artifacts
+    from .embeddings import generate_embedding
     from .schemas import (
         BlockContent, BlockItem, CanvasOutline, CanvasPlan, InteractionRequest,
         OutlineBlock, OutlineUpdate, PlanBlock, PlanUpdate,
     )
 except ImportError:
     from database import Artifact, ArtifactBlock, retrieve_artifacts
+    from embeddings import generate_embedding
     from schemas import (
         BlockContent, BlockItem, CanvasOutline, CanvasPlan, InteractionRequest,
         OutlineBlock, OutlineUpdate, PlanBlock, PlanUpdate,
@@ -25,8 +27,8 @@ except ImportError:
 
 SYSTEM_PROMPT = """You are the generative composition engine for No Notes, an AI interface without chats or threads.
 The user works on one persistent spatial canvas. The focused artifact is the default subject of pronouns like this, it, and that.
-An artifact with kind `welcome` is orientation, never the user's working topic. Any substantive request while it is focused MUST create a new artifact in a separate region.
-For other artifacts, choose modify or extend only when the request refers to the focused work (for example: this, that, it, add, revise, continue, go deeper, or what about). A self-contained request that introduces its own subject creates a new artifact even if something is focused. Choose navigate when the request asks to revisit relevant existing work.
+An artifact with kind `welcome` is orientation, never the user's working topic. When it is focused, ignore it as a target: continue a strong retrieved non-welcome match, or create a new artifact when no such match exists.
+Retrieved artifacts are semantic candidates, ranked by meaning rather than exact words. When the request develops a subject already represented by a strong candidate, modify or extend that candidate even if it is not focused and the user did not explicitly name it as a follow-up. Focus is a useful signal, not a boundary. Create a new artifact only when no retrieved candidate meaningfully covers the subject or the user explicitly asks for a separate treatment. Choose navigate only when the user asks to revisit work without changing it.
 Compose approachable, information-rich answers using a small vocabulary of generative UI blocks. You are not limited to diagrams: combine free text, editorial prose, comparisons, processes, timelines, metrics, callouts, and diagrams when helpful.
 Prefer 2-5 blocks. Use boxes only when grouping adds meaning. Keep most prose visually free-standing. Existing stable block IDs may be used in updates; never invent an existing ID.
 Styling is controlled by the renderer. Choose block semantics and concise content, not CSS or arbitrary HTML.
@@ -43,7 +45,7 @@ The outline is a space contract: choose 3-5 complementary blocks, their order, e
 Use free-standing hero or rich text for explanation. Use a diagram, process, comparison, timeline, or metrics block only when it clarifies a relationship.
 Prefer varied, whiteboard-like compositions over uniform card grids. Keep item_count at 3-5 for visual blocks and zero for prose or callouts.
 Use `large` for heroes and dense timelines/diagrams, `compact` for callouts, and `standard` otherwise.
-The focused artifact is the subject of referential follow-ups. A self-contained new subject creates a separate artifact. A `welcome` artifact is never edited.
+The context contains semantically ranked artifact candidates with retrieval scores. Continue the best strong semantic match even when it is not focused and the request is phrased as a self-contained question. Use focus to resolve pronouns and close calls. Create a separate artifact only when the subject is genuinely distinct or the user explicitly asks for a new/separate treatment. A `welcome` artifact is never edited. For modify, extend, or navigate, target_artifact_id must be one of the supplied non-welcome artifact IDs.
 For updates, use only supplied existing block IDs and preserve the block's kind. Do not write the actual answer yet."""
 
 OUTLINE_TOOL = {
@@ -61,10 +63,17 @@ CONTENT_TOOL = {
 logger = logging.getLogger(__name__)
 
 
-def _compact_context(session: Session, request: InteractionRequest) -> dict:
-    artifacts = retrieve_artifacts(session, request.context.canvas_id, request.message, request.context.focused_artifact_id)
+async def _compact_context(session: Session, request: InteractionRequest) -> dict:
+    embedding = None
+    if session.bind and session.bind.dialect.name == "postgresql":
+        embedding = await generate_embedding(request.message)
+    candidates = retrieve_artifacts(
+        session, request.context.canvas_id, request.message,
+        request.context.focused_artifact_id, embedding,
+    )
     result = []
-    for artifact in artifacts:
+    for candidate in candidates:
+        artifact = candidate.artifact
         blocks = list(session.scalars(select(ArtifactBlock).where(ArtifactBlock.artifact_id == artifact.id).order_by(ArtifactBlock.order)))
         result.append({
             "id": artifact.id,
@@ -72,9 +81,19 @@ def _compact_context(session: Session, request: InteractionRequest) -> dict:
             "summary": artifact.summary,
             "kind": artifact.kind,
             "focused": artifact.id == request.context.focused_artifact_id,
+            "retrieval": {
+                "score": round(candidate.score, 4),
+                "semantic": round(candidate.semantic_score, 4),
+                "lexical": round(candidate.lexical_score, 4),
+                "focus": round(candidate.focus_score, 4),
+            },
             "blocks": [{"id": block.id, "kind": block.kind, "content": block.content} for block in blocks],
         })
-    return {"artifacts": result, "focused_block_ids": request.context.focused_block_ids}
+    return {
+        "retrieval_method": "semantic_hybrid" if embedding else "lexical_focus_fallback",
+        "artifacts": result,
+        "focused_block_ids": request.context.focused_block_ids,
+    }
 
 
 async def anthropic_plan(session: Session, request: InteractionRequest) -> CanvasPlan | None:
@@ -87,7 +106,7 @@ async def anthropic_plan(session: Session, request: InteractionRequest) -> Canva
         "system": SYSTEM_PROMPT,
         "tools": [TOOL],
         "tool_choice": {"type": "tool", "name": "compose_artifact"},
-        "messages": [{"role": "user", "content": f"Request: {request.message}\n\nSpatial context:\n{json.dumps(_compact_context(session, request), ensure_ascii=False)}"}],
+        "messages": [{"role": "user", "content": f"Request: {request.message}\n\nSpatial context:\n{json.dumps(await _compact_context(session, request), ensure_ascii=False)}"}],
     }
     headers = {"x-api-key": api_key, "anthropic-version": "2023-06-01", "content-type": "application/json"}
     async with httpx.AsyncClient(timeout=55) as client:
@@ -135,15 +154,16 @@ async def _call_tool(system: str, tool: dict, prompt: str, max_tokens: int) -> d
     raise ValueError(f"Claude did not call {tool['name']}")
 
 
-async def anthropic_outline(session: Session, request: InteractionRequest) -> CanvasOutline:
-    context = json.dumps(_compact_context(session, request), ensure_ascii=False)
+async def anthropic_outline(session: Session, request: InteractionRequest) -> tuple[CanvasOutline, dict]:
+    context_data = await _compact_context(session, request)
+    context = json.dumps(context_data, ensure_ascii=False)
     raw = await _call_tool(
         OUTLINE_PROMPT,
         OUTLINE_TOOL,
         f"Request: {request.message}\n\nAvailable spatial context:\n{context}",
         1100,
     )
-    return CanvasOutline.model_validate(raw)
+    return CanvasOutline.model_validate(raw), context_data
 
 
 def _outline_from_plan(session: Session, plan: CanvasPlan) -> tuple[CanvasOutline, dict[str, PlanBlock]]:
@@ -180,19 +200,20 @@ def _outline_from_plan(session: Session, plan: CanvasPlan) -> tuple[CanvasOutlin
     ), fallback_content
 
 
-async def make_outline(session: Session, request: InteractionRequest) -> tuple[CanvasOutline, str, dict[str, PlanBlock]]:
+async def make_outline(session: Session, request: InteractionRequest) -> tuple[CanvasOutline, str, dict[str, PlanBlock], dict]:
     try:
-        outline = await anthropic_outline(session, request)
-        focused = session.get(Artifact, request.context.focused_artifact_id) if request.context.focused_artifact_id else None
-        if focused and focused.kind == "welcome" and outline.mode != "new":
+        outline, retrieval = await anthropic_outline(session, request)
+        target = session.get(Artifact, outline.target_artifact_id) if outline.target_artifact_id else None
+        retrieved_ids = {item["id"] for item in retrieval.get("artifacts", []) if item.get("kind") != "welcome"}
+        if outline.mode != "new" and (not target or target.kind == "welcome" or target.id not in retrieved_ids):
             outline = outline.model_copy(update={"mode": "new", "target_artifact_id": None, "updates": []})
-        return outline, "claude", {}
+        return outline, "claude", {}, retrieval
     except (httpx.HTTPError, ValueError) as exc:
         logger.warning("Anthropic outline unavailable: %s", type(exc).__name__)
         if os.getenv("NONOTES_STRICT_MODEL") == "1":
             raise
     outline, fallback_content = _outline_from_plan(session, fallback_plan(session, request))
-    return outline, "local", fallback_content
+    return outline, "local", fallback_content, {"retrieval_method": "unavailable", "artifacts": []}
 
 
 async def fill_outline_block(

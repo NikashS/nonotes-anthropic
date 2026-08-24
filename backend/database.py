@@ -6,7 +6,10 @@ from pathlib import Path
 from uuid import uuid4
 
 from dotenv import load_dotenv
-from sqlalchemy import JSON, DateTime, Float, ForeignKey, Index, Integer, String, Text, create_engine, select
+from dataclasses import dataclass
+import re
+
+from sqlalchemy import JSON, DateTime, Float, ForeignKey, Index, Integer, String, Text, create_engine, select, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column
 from sqlalchemy.pool import NullPool
 
@@ -187,15 +190,95 @@ def write_revision(session: Session, artifact_id: str, run_id: str | None) -> No
     ))
 
 
-def retrieve_artifacts(session: Session, canvas_id: str, query: str, focused_artifact_id: str | None, limit: int = 5) -> list[Artifact]:
+@dataclass
+class RetrievedArtifact:
+    artifact: Artifact
+    semantic_score: float = 0
+    lexical_score: float = 0
+    focus_score: float = 0
+    score: float = 0
+
+
+_STOP_WORDS = {
+    "about", "after", "again", "also", "and", "are", "build", "can", "could", "for", "from",
+    "have", "how", "into", "more", "that", "the", "their", "tell", "this", "what", "when", "where",
+    "which", "with", "would", "you", "your",
+}
+
+
+def _terms(value: str) -> set[str]:
+    return {word for word in re.findall(r"[a-z0-9]+", value.lower()) if len(word) > 2 and word not in _STOP_WORDS}
+
+
+def _vector_literal(embedding: list[float]) -> str:
+    return "[" + ",".join(f"{value:.8f}" for value in embedding) + "]"
+
+
+def retrieve_artifacts(
+    session: Session,
+    canvas_id: str,
+    query: str,
+    focused_artifact_id: str | None,
+    embedding: list[float] | None = None,
+    limit: int = 6,
+) -> list[RetrievedArtifact]:
     artifacts = list(session.scalars(select(Artifact).where(Artifact.canvas_id == canvas_id)))
-    terms = {word.strip(".,?!:;()[]{}\"").lower() for word in query.split() if len(word) > 2}
+    semantic_scores: dict[str, float] = {}
+    if embedding and session.bind and session.bind.dialect.name == "postgresql":
+        rows = session.execute(text("""
+            select artifact_id, semantic_score
+            from public.match_artifacts(cast(:embedding as extensions.vector), :canvas_id, :match_count)
+        """), {
+            "embedding": _vector_literal(embedding),
+            "canvas_id": canvas_id,
+            "match_count": max(limit * 2, 8),
+        })
+        semantic_scores = {row.artifact_id: max(0.0, float(row.semantic_score)) for row in rows}
 
-    def score(artifact: Artifact) -> float:
-        haystack = f"{artifact.title} {artifact.summary}".lower()
-        return sum(1.0 for term in terms if term in haystack) + (8.0 if artifact.id == focused_artifact_id else 0.0)
+    query_terms = _terms(query)
+    candidates: list[RetrievedArtifact] = []
+    for artifact in artifacts:
+        artifact_terms = _terms(f"{artifact.title} {artifact.summary}")
+        overlap = len(query_terms & artifact_terms)
+        lexical = overlap / max(1, len(query_terms | artifact_terms))
+        semantic = semantic_scores.get(artifact.id, 0.0)
+        focus = 0.07 if artifact.id == focused_artifact_id and artifact.kind != "welcome" else 0.0
+        # Semantics dominate; lexical overlap and focus break close calls.
+        score = semantic * 0.82 + lexical * 0.13 + focus
+        if artifact.kind == "welcome":
+            score = -1
+        candidates.append(RetrievedArtifact(artifact, semantic, lexical, focus, score))
+    return sorted(candidates, key=lambda item: item.score, reverse=True)[:limit]
 
-    return sorted(artifacts, key=score, reverse=True)[:limit]
+
+def artifact_embedding_text(session: Session, artifact: Artifact) -> str:
+    blocks = list(session.scalars(
+        select(ArtifactBlock).where(ArtifactBlock.artifact_id == artifact.id).order_by(ArtifactBlock.order)
+    ))
+    parts = [artifact.title, artifact.summary]
+    for block in blocks:
+        content = block.content or {}
+        parts.extend([str(content.get("title", "")), str(content.get("body", ""))])
+        for item in content.get("items", []):
+            if isinstance(item, dict):
+                parts.extend([str(item.get("title", "")), str(item.get("body", ""))])
+    return "\n".join(part for part in parts if part).strip()[:16_000]
+
+
+def store_artifact_embedding(session: Session, artifact_id: str, source_text: str, embedding: list[float]) -> None:
+    if not session.bind or session.bind.dialect.name != "postgresql":
+        return
+    session.execute(text("""
+        update artifacts
+        set embedding = cast(:embedding as extensions.vector),
+            embedding_text = :source_text,
+            embedding_updated_at = now()
+        where id = :artifact_id
+    """), {
+        "embedding": _vector_literal(embedding),
+        "source_text": source_text,
+        "artifact_id": artifact_id,
+    })
 
 
 def init_database() -> None:
@@ -228,15 +311,12 @@ def init_database() -> None:
         if not has_blocks:
             seed_blocks = [
                 ArtifactBlock(id="block_vision", artifact_id=artifact.id, kind="hero", variant="plain", order=0, content={"eyebrow": "A spatial AI workspace", "title": "No Notes", "body": "Ask for what you remember. The system finds the right work and continues it in place."}, html="<p class=\"eyebrow\">A spatial AI workspace</p><h1>No Notes</h1><p class=\"lede\">Ask for what you remember. The system finds the right work and continues it <strong>in place</strong>.</p>"),
-                ArtifactBlock(id="block_flow", artifact_id=artifact.id, kind="process", variant="sketch", order=1, content={"title": "From memory to momentum", "items": [{"title": "Ask naturally", "body": ""}, {"title": "Retrieve durable artifacts", "body": ""}, {"title": "Continue the work", "body": ""}]}, html="<h2>From memory to momentum</h2><div class=\"process-line\"><div><strong>Ask naturally</strong></div><i></i><div><strong>Retrieve durable artifacts</strong></div><i></i><div><strong>Continue the work</strong></div></div>"),
+                ArtifactBlock(id="block_flow", artifact_id=artifact.id, kind="process", variant="sketch", order=1, content={"title": "From memory to momentum", "items": [{"title": "Ask naturally", "body": ""}, {"title": "Retrieve durable artifacts", "body": ""}, {"title": "Continue the work", "body": ""}]}, html="<h2>From memory to momentum</h2><div class=\"process-line\" data-count=\"3\"><div><strong>Ask naturally</strong></div><div><strong>Retrieve durable artifacts</strong></div><div><strong>Continue the work</strong></div></div>"),
                 ArtifactBlock(id="block_principles", artifact_id=artifact.id, kind="comparison", variant="paper", order=2, content={"title": "The interaction model", "items": [{"label": "Instead of", "title": "No chats to find", "body": "Intent is the navigation."}, {"label": "Continuity", "title": "No blank canvas on follow-up", "body": "Focused work changes in place."}, {"label": "Expression", "title": "No diagram-only answers", "body": "Text, visuals, tables, and documents coexist."}]}, html="<h2>The interaction model</h2><div class=\"comparison-grid\"><article><small>Instead of</small><strong>No chats to find</strong><p>Intent is the navigation.</p></article><article><small>Continuity</small><strong>No blank canvas on follow-up</strong><p>Focused work changes in place.</p></article><article><small>Expression</small><strong>No diagram-only answers</strong><p>Text, visuals, tables, and documents coexist.</p></article></div>"),
                 ArtifactBlock(id="block_note", artifact_id=artifact.id, kind="callout", variant="ink", order=3, content={"title": "The invariant", "body": "A follow-up modifies or extends the focused artifact. Only genuinely separate intent creates a new spatial region."}, html="<span class=\"scribble\">The invariant</span><p>A follow-up modifies or extends the focused artifact. Only genuinely separate intent creates a new spatial region.</p>"),
             ]
             session.add_all(seed_blocks)
         else:
-            flow = session.get(ArtifactBlock, "block_flow")
-            if flow and "<span>" in flow.html:
-                flow.html = "<h2>From memory to momentum</h2><div class=\"process-line\"><div><strong>Ask naturally</strong></div><i></i><div><strong>Retrieve durable artifacts</strong></div><i></i><div><strong>Continue the work</strong></div></div>"
             principles = session.get(ArtifactBlock, "block_principles")
             if principles and any(isinstance(item, str) for item in (principles.content or {}).get("items", [])):
                 principles.content = {

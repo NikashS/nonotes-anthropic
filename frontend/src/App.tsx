@@ -10,6 +10,8 @@ const suggestions = [
   'Map a relaxed ten-day first trip through Japan',
 ]
 
+const focusStorageKey = (canvasId: string) => `nonotes:focus:${canvasId}`
+
 function cameraForArtifact(artifact: Artifact): Viewport {
   const viewportWidth = window.innerWidth
   const topInset = 68
@@ -48,11 +50,14 @@ export default function App() {
         setArtifacts(snapshot.artifacts)
         artifactsRef.current = snapshot.artifacts
         setBlocks(snapshot.blocks)
-        const first = snapshot.artifacts[0]
-        if (first) {
-          setFocusedArtifactId(first.id)
-          setFocusedBlockIds(snapshot.blocks.filter((block) => block.artifact_id === first.id).slice(0, 1).map((block) => block.id))
-          setCamera(cameraForArtifact(first))
+        const storedFocus = window.localStorage.getItem(focusStorageKey(snapshot.id))
+        const initial = snapshot.artifacts.find((item) => item.id === storedFocus)
+          ?? [...snapshot.artifacts].filter((item) => item.kind !== 'welcome').sort((a, b) => b.updated_at.localeCompare(a.updated_at))[0]
+          ?? snapshot.artifacts[0]
+        if (initial) {
+          setFocusedArtifactId(initial.id)
+          setFocusedBlockIds(snapshot.blocks.filter((block) => block.artifact_id === initial.id).slice(0, 1).map((block) => block.id))
+          setCamera(cameraForArtifact(initial))
         }
         setStatus('')
       })
@@ -64,11 +69,9 @@ export default function App() {
   }, [])
 
   const upsertArtifact = useCallback((artifact: Artifact) => {
-    setArtifacts((current) => {
-      const next = [...current.filter((item) => item.id !== artifact.id), artifact]
-      artifactsRef.current = next
-      return next
-    })
+    const next = [...artifactsRef.current.filter((item) => item.id !== artifact.id), artifact]
+    artifactsRef.current = next
+    setArtifacts(next)
   }, [])
 
   const focusArtifact = useCallback((artifactId: string, remember = true) => {
@@ -82,8 +85,9 @@ export default function App() {
     } else {
       setFocusedArtifactId(artifactId)
     }
+    window.localStorage.setItem(focusStorageKey(canvasId), artifactId)
     setCamera(cameraForArtifact(artifact))
-  }, [])
+  }, [canvasId])
 
   const requestFocus = useCallback((artifactId: string, blockIds: string[], transition: string) => {
     setFocusedBlockIds(blockIds)

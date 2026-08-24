@@ -7,8 +7,9 @@ from fastapi.testclient import TestClient
 
 os.environ["DATABASE_URL"] = f"sqlite:////tmp/nonotes-test-{uuid4().hex}.db"
 
-from backend.main import app
+from backend.main import _compile_fragments, app
 from backend.planner import _validate_plan_input
+from backend.schemas import BlockItem
 
 client = TestClient(app)
 
@@ -53,6 +54,14 @@ def test_legacy_comparison_rows_are_normalized_for_model_output() -> None:
     })
     assert plan.blocks[0].items[1].title == "Strong joins"
     assert plan.blocks[0].items[1].body == "Flexible shape"
+
+
+def test_process_renderer_never_places_content_in_connector_columns() -> None:
+    items = [BlockItem(title=f"Step {index}", body="Readable content") for index in range(1, 8)]
+    html = "".join(_compile_fragments("process", "Seven steps", "", "", items))
+    assert html.count("<div>") == 7
+    assert "<i>" not in html
+    assert 'data-count="7"' in html
 
 
 def test_first_question_leaves_welcome_and_uses_a_new_region() -> None:

@@ -13,16 +13,20 @@ from sqlalchemy.orm import Session
 
 try:
     from .database import (
-        Artifact, ArtifactBlock, ArtifactRegion, InteractionRun, canvas_snapshot,
-        engine, new_id, serialize_artifact, serialize_block, utcnow, write_revision,
+        Artifact, ArtifactBlock, ArtifactRegion, InteractionRun, artifact_embedding_text,
+        canvas_snapshot, engine, new_id, serialize_artifact, serialize_block,
+        store_artifact_embedding, utcnow, write_revision,
     )
+    from .embeddings import generate_embedding
     from .planner import fill_outline_block, make_outline
     from .schemas import BlockItem, InteractionRequest, OutlineBlock, OutlineUpdate, PlanBlock
 except ImportError:
     from database import (
-        Artifact, ArtifactBlock, ArtifactRegion, InteractionRun, canvas_snapshot,
-        engine, new_id, serialize_artifact, serialize_block, utcnow, write_revision,
+        Artifact, ArtifactBlock, ArtifactRegion, InteractionRun, artifact_embedding_text,
+        canvas_snapshot, engine, new_id, serialize_artifact, serialize_block,
+        store_artifact_embedding, utcnow, write_revision,
     )
+    from embeddings import generate_embedding
     from planner import fill_outline_block, make_outline
     from schemas import BlockItem, InteractionRequest, OutlineBlock, OutlineUpdate, PlanBlock
 
@@ -64,7 +68,7 @@ def _compile_fragments(kind: str, title: str, eyebrow: str, body: str, items: li
     if kind == "rich_text":
         return [f"<h2>{safe_title}</h2>" if title else "", f"<p>{safe_body}</p>" if body else ""]
     if kind == "process":
-        steps = '<div class="process-line">' + '<i></i>'.join(_item_html(item, "div") for item in items) + "</div>"
+        steps = f'<div class="process-line" data-count="{len(items)}">' + "".join(_item_html(item, "div") for item in items) + "</div>"
         return [f"<h2>{safe_title}</h2>" if title else "", steps]
     if kind == "comparison":
         return [f"<h2>{safe_title}</h2>" if title else "", '<div class="comparison-grid">' + "".join(_item_html(item) for item in items) + "</div>"]
@@ -72,7 +76,7 @@ def _compile_fragments(kind: str, title: str, eyebrow: str, body: str, items: li
         return [f"<h2>{safe_title}</h2>" if title else "", '<ol class="timeline">' + "".join(_item_html(item, "li") for item in items) + "</ol>"]
     if kind == "diagram":
         nodes = "".join(f'<article><b>{index + 1}</b><strong>{escape(item.title)}</strong><p>{escape(item.body)}</p></article>' for index, item in enumerate(items))
-        return [f"<h2>{safe_title}</h2>" if title else "", f'<p class="diagram-intro">{safe_body}</p>' if body else "", f'<div class="diagram-flow">{nodes}</div>']
+        return [f"<h2>{safe_title}</h2>" if title else "", f'<p class="diagram-intro">{safe_body}</p>' if body else "", f'<div class="diagram-flow" data-count="{len(items)}">{nodes}</div>']
     if kind == "callout":
         return [f'<span class="scribble">{safe_title}</span>' if title else "", f"<p>{safe_body}</p>" if body else ""]
     if kind == "metrics":
@@ -105,7 +109,7 @@ def _skeleton_html(slot: OutlineBlock | OutlineUpdate) -> str:
         return '<div class="outline-line outline-kicker"></div><div class="outline-line outline-heading"></div><div class="outline-line outline-copy"></div>'
     if slot.kind in {"process", "diagram", "comparison", "timeline", "metrics"}:
         items = "".join('<i class="outline-item"></i>' for _ in range(max(slot.item_count, 3)))
-        return title + f'<div class="outline-visual">{items}</div>'
+        return title + f'<div class="outline-visual" data-count="{max(slot.item_count, 3)}">{items}</div>'
     if slot.kind == "callout":
         return title + '<div class="outline-line outline-copy"></div><div class="outline-line outline-short"></div>'
     return title + '<div class="outline-line outline-copy"></div><div class="outline-line outline-copy"></div><div class="outline-line outline-short"></div>'
@@ -148,10 +152,11 @@ async def _interaction_stream(request: InteractionRequest) -> AsyncIterator[str]
 
     try:
         with Session(engine) as session:
-            outline, planner, fallbacks = await make_outline(session, request)
+            outline, planner, fallbacks, retrieval = await make_outline(session, request)
             run = session.get(InteractionRun, run_id)
             assert run
             run.behavior = outline.mode
+            run.context = {**(run.context or {}), "retrieval": retrieval}
 
             artifact = session.get(Artifact, outline.target_artifact_id) if outline.target_artifact_id else None
             is_new = outline.mode == "new" or not artifact
@@ -245,6 +250,10 @@ async def _interaction_stream(request: InteractionRequest) -> AsyncIterator[str]
             if not focus_ids:
                 focus_ids = [block.id for block in session.scalars(select(ArtifactBlock).where(ArtifactBlock.artifact_id == artifact.id))]
             write_revision(session, artifact.id, run_id)
+            embedding_text = artifact_embedding_text(session, artifact)
+            embedding = await generate_embedding(embedding_text) if session.bind and session.bind.dialect.name == "postgresql" else None
+            if embedding:
+                store_artifact_embedding(session, artifact.id, embedding_text, embedding)
             run.status = "completed"
             run.completed_at = utcnow()
             session.commit()

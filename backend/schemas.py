@@ -81,6 +81,15 @@ class BlockContent(BaseModel):
     items: list[BlockItem] = Field(default_factory=list)
 
 
+class GeneratedBlock(BaseModel):
+    ref: str
+    content: BlockContent
+
+
+class GeneratedBlockBatch(BaseModel):
+    blocks: list[GeneratedBlock] = Field(default_factory=list)
+
+
 class CanvasPlan(BaseModel):
     model_config = ConfigDict(extra="ignore")
 

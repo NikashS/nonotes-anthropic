@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import os
 from uuid import uuid4
 
@@ -8,8 +9,9 @@ from fastapi.testclient import TestClient
 os.environ["DATABASE_URL"] = f"sqlite:////tmp/nonotes-test-{uuid4().hex}.db"
 
 from backend.main import _compile_fragments, app
+from backend import planner
 from backend.planner import _validate_plan_input
-from backend.schemas import BlockItem
+from backend.schemas import BlockItem, InteractionRequest, OutlineBlock
 
 client = TestClient(app)
 
@@ -62,6 +64,35 @@ def test_process_renderer_never_places_content_in_connector_columns() -> None:
     assert html.count("<div>") == 7
     assert "<i>" not in html
     assert 'data-count="7"' in html
+
+
+def test_all_outline_blocks_are_filled_with_one_model_call(monkeypatch) -> None:
+    calls = 0
+
+    async def fake_call_tool(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return {"blocks": [
+            {"ref": "intro", "content": {"title": "Fast intro", "body": "One pass."}},
+            {"ref": "steps", "content": {"title": "Flow", "items": [
+                {"title": "One", "body": "First"},
+                {"title": "Two", "body": "Second"},
+                {"title": "Three", "body": "Ignored"},
+            ]}},
+        ]}
+
+    monkeypatch.setattr(planner, "_call_tool", fake_call_tool)
+    slots = [
+        (OutlineBlock(ref="intro", kind="rich_text"), None),
+        (OutlineBlock(ref="steps", kind="process", item_count=2), None),
+    ]
+    result = asyncio.run(planner.fill_outline_blocks(
+        InteractionRequest(message="Explain a flow"), "Flow", "A useful flow", slots, "claude", {},
+    ))
+
+    assert calls == 1
+    assert set(result) == {"intro", "steps"}
+    assert len(result["steps"].items) == 2
 
 
 def test_first_question_leaves_welcome_and_uses_a_new_region() -> None:

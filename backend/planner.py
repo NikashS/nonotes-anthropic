@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import re
+import time
 
 import httpx
 from sqlalchemy import select
@@ -13,32 +14,17 @@ try:
     from .database import Artifact, ArtifactBlock, retrieve_artifacts
     from .embeddings import generate_embedding
     from .schemas import (
-        BlockContent, BlockItem, CanvasOutline, CanvasPlan, InteractionRequest,
+        BlockContent, BlockItem, CanvasOutline, CanvasPlan, GeneratedBlockBatch, InteractionRequest,
         OutlineBlock, OutlineUpdate, PlanBlock, PlanUpdate,
     )
 except ImportError:
     from database import Artifact, ArtifactBlock, retrieve_artifacts
     from embeddings import generate_embedding
     from schemas import (
-        BlockContent, BlockItem, CanvasOutline, CanvasPlan, InteractionRequest,
+        BlockContent, BlockItem, CanvasOutline, CanvasPlan, GeneratedBlockBatch, InteractionRequest,
         OutlineBlock, OutlineUpdate, PlanBlock, PlanUpdate,
     )
 
-
-SYSTEM_PROMPT = """You are the generative composition engine for No Notes, an AI interface without chats or threads.
-The user works on one persistent spatial canvas. The focused artifact is the default subject of pronouns like this, it, and that.
-An artifact with kind `welcome` is orientation, never the user's working topic. When it is focused, ignore it as a target: continue a strong retrieved non-welcome match, or create a new artifact when no such match exists.
-Retrieved artifacts are semantic candidates, ranked by meaning rather than exact words. When the request develops a subject already represented by a strong candidate, modify or extend that candidate even if it is not focused and the user did not explicitly name it as a follow-up. Focus is a useful signal, not a boundary. Create a new artifact only when no retrieved candidate meaningfully covers the subject or the user explicitly asks for a separate treatment. Choose navigate only when the user asks to revisit work without changing it.
-Compose approachable, information-rich answers using a small vocabulary of generative UI blocks. You are not limited to diagrams: combine free text, editorial prose, comparisons, processes, timelines, metrics, callouts, and diagrams when helpful.
-Prefer 2-5 blocks. Use boxes only when grouping adds meaning. Keep most prose visually free-standing. Existing stable block IDs may be used in updates; never invent an existing ID.
-Styling is controlled by the renderer. Choose block semantics and concise content, not CSS or arbitrary HTML.
-The result must stand alone, directly answer the request, and preserve the focused artifact unless the intent is truly separate."""
-
-TOOL = {
-    "name": "compose_artifact",
-    "description": "Plan targeted edits or additions to a persistent spatial artifact using themed generative UI blocks.",
-    "input_schema": CanvasPlan.model_json_schema(),
-}
 
 OUTLINE_PROMPT = """You are the spatial editor for No Notes. Decide where an answer belongs, then return only a compact visual outline.
 The outline is a space contract: choose 3-5 complementary blocks, their order, expected item counts, and size before content is written.
@@ -55,22 +41,36 @@ OUTLINE_TOOL = {
 }
 
 CONTENT_TOOL = {
-    "name": "fill_block",
-    "description": "Write concise content for one predefined visual block.",
-    "input_schema": BlockContent.model_json_schema(),
+    "name": "fill_blocks",
+    "description": "Write concise content for every predefined visual block in one response.",
+    "input_schema": GeneratedBlockBatch.model_json_schema(),
 }
 
 logger = logging.getLogger(__name__)
 
 
+def _log_timing(stage: str, started: float, **details: object) -> None:
+    logger.info(json.dumps({
+        "level": "info",
+        "message": "latency.stage",
+        "stage": stage,
+        "duration_ms": round((time.perf_counter() - started) * 1000),
+        **details,
+    }))
+
+
 async def _compact_context(session: Session, request: InteractionRequest) -> dict:
     embedding = None
     if session.bind and session.bind.dialect.name == "postgresql":
+        started = time.perf_counter()
         embedding = await generate_embedding(request.message)
+        _log_timing("retrieval.embedding", started, available=bool(embedding))
+    started = time.perf_counter()
     candidates = retrieve_artifacts(
         session, request.context.canvas_id, request.message,
         request.context.focused_artifact_id, embedding,
     )
+    _log_timing("retrieval.database", started, candidate_count=len(candidates))
     result = []
     for candidate in candidates:
         artifact = candidate.artifact
@@ -96,28 +96,6 @@ async def _compact_context(session: Session, request: InteractionRequest) -> dic
     }
 
 
-async def anthropic_plan(session: Session, request: InteractionRequest) -> CanvasPlan | None:
-    api_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
-    if not api_key:
-        return None
-    payload = {
-        "model": os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-6"),
-        "max_tokens": 4096,
-        "system": SYSTEM_PROMPT,
-        "tools": [TOOL],
-        "tool_choice": {"type": "tool", "name": "compose_artifact"},
-        "messages": [{"role": "user", "content": f"Request: {request.message}\n\nSpatial context:\n{json.dumps(await _compact_context(session, request), ensure_ascii=False)}"}],
-    }
-    headers = {"x-api-key": api_key, "anthropic-version": "2023-06-01", "content-type": "application/json"}
-    async with httpx.AsyncClient(timeout=55) as client:
-        response = await client.post("https://api.anthropic.com/v1/messages", headers=headers, json=payload)
-        response.raise_for_status()
-    for block in response.json().get("content", []):
-        if block.get("type") == "tool_use" and block.get("name") == "compose_artifact":
-            return _validate_plan_input(block["input"])
-    raise ValueError("Claude did not return an artifact composition")
-
-
 def _validate_plan_input(raw: dict) -> CanvasPlan:
     """Accept the compact pipe-delimited rows used by older persisted blocks."""
     for collection in (raw.get("blocks", []), raw.get("updates", [])):
@@ -132,7 +110,7 @@ def _validate_plan_input(raw: dict) -> CanvasPlan:
     return CanvasPlan.model_validate(raw)
 
 
-async def _call_tool(system: str, tool: dict, prompt: str, max_tokens: int) -> dict:
+async def _call_tool(system: str, tool: dict, prompt: str, max_tokens: int, timeout_seconds: float) -> dict:
     api_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
     if not api_key:
         raise ValueError("Anthropic is not configured")
@@ -145,9 +123,14 @@ async def _call_tool(system: str, tool: dict, prompt: str, max_tokens: int) -> d
         "messages": [{"role": "user", "content": prompt}],
     }
     headers = {"x-api-key": api_key, "anthropic-version": "2023-06-01", "content-type": "application/json"}
-    async with httpx.AsyncClient(timeout=45) as client:
-        response = await client.post("https://api.anthropic.com/v1/messages", headers=headers, json=payload)
-        response.raise_for_status()
+    started = time.perf_counter()
+    try:
+        timeout = httpx.Timeout(timeout_seconds, connect=5, write=5, pool=5)
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            response = await client.post("https://api.anthropic.com/v1/messages", headers=headers, json=payload)
+            response.raise_for_status()
+    finally:
+        _log_timing(f"anthropic.{tool['name']}", started, max_tokens=max_tokens)
     for block in response.json().get("content", []):
         if block.get("type") == "tool_use" and block.get("name") == tool["name"]:
             return block["input"]
@@ -161,7 +144,8 @@ async def anthropic_outline(session: Session, request: InteractionRequest) -> tu
         OUTLINE_PROMPT,
         OUTLINE_TOOL,
         f"Request: {request.message}\n\nAvailable spatial context:\n{context}",
-        1100,
+        900,
+        14,
     )
     return CanvasOutline.model_validate(raw), context_data
 
@@ -216,51 +200,58 @@ async def make_outline(session: Session, request: InteractionRequest) -> tuple[C
     return outline, "local", fallback_content, {"retrieval_method": "unavailable", "artifacts": []}
 
 
-async def fill_outline_block(
+async def fill_outline_blocks(
     request: InteractionRequest,
     artifact_title: str,
     artifact_summary: str,
-    slot: OutlineBlock | OutlineUpdate,
-    existing_content: dict | None,
+    slots: list[tuple[OutlineBlock | OutlineUpdate, dict | None]],
     planner: str,
-    fallback: PlanBlock | None,
-) -> PlanBlock:
-    if planner == "local" and fallback:
-        return fallback
-    system = """You write one section of a hand-drawn visual explanation. Respect the predefined block kind and footprint exactly.
-Return the requested number of items so the layout does not shift. Be concrete, explanatory, and concise. Avoid generic introductions, UI language, and repeated conclusions.
+    fallbacks: dict[str, PlanBlock],
+) -> dict[str, PlanBlock]:
+    if not slots:
+        return {}
+    if planner == "local":
+        return {slot.ref: fallbacks[slot.ref] for slot, _ in slots if slot.ref in fallbacks}
+    system = """You write every section of one hand-drawn visual explanation in a single pass. Respect each predefined block kind, reference, and footprint exactly.
+Return one result for every supplied ref and no others, in the same order. Return the requested number of items so the layout does not shift. Make the sections complementary rather than repetitive. Be concrete, explanatory, and concise. Avoid generic introductions and UI language.
 For diagrams and processes, each item is a node or step. For comparisons, each item is a meaningful dimension or option. For timelines, each item is a stage. Body text should usually stay under 80 words and item bodies under 24 words."""
     prompt = json.dumps({
         "request": request.message,
         "artifact": {"title": artifact_title, "summary": artifact_summary},
-        "slot": slot.model_dump(),
-        "existing_content": existing_content,
-        "requirements": {
-            "kind": slot.kind,
-            "title_hint": slot.title_hint,
-            "exact_item_count": slot.item_count,
-            "size": slot.size,
-        },
+        "slots": [
+            {
+                "outline": slot.model_dump(),
+                "existing_content": existing,
+                "requirements": {"exact_item_count": slot.item_count},
+            }
+            for slot, existing in slots
+        ],
     }, ensure_ascii=False)
     try:
-        raw = await _call_tool(system, CONTENT_TOOL, prompt, 900)
-        content = BlockContent.model_validate(raw)
-        if slot.item_count:
-            content.items = content.items[:slot.item_count]
-        else:
-            content.items = []
-        return PlanBlock(
-            ref=slot.ref, kind=slot.kind, title=content.title or slot.title_hint,
-            eyebrow=content.eyebrow, body=content.body, items=content.items, variant=slot.variant,
-        )
+        raw = await _call_tool(system, CONTENT_TOOL, prompt, min(2600, 500 + len(slots) * 420), 26)
+        batch = GeneratedBlockBatch.model_validate(raw)
+        generated = {item.ref: item.content for item in batch.blocks}
     except (httpx.HTTPError, ValueError) as exc:
-        logger.warning("Anthropic block generation unavailable for %s: %s", slot.ref, type(exc).__name__)
-        if fallback:
-            return fallback
-        return PlanBlock(
-            ref=slot.ref, kind=slot.kind, title=slot.title_hint,
-            body="This section could not be completed. Try asking to continue it.", variant=slot.variant,
-        )
+        logger.warning("Anthropic batch generation unavailable: %s", type(exc).__name__)
+        generated = {}
+
+    result: dict[str, PlanBlock] = {}
+    for slot, _ in slots:
+        content = generated.get(slot.ref)
+        if content:
+            content.items = content.items[:slot.item_count] if slot.item_count else []
+            result[slot.ref] = PlanBlock(
+                ref=slot.ref, kind=slot.kind, title=content.title or slot.title_hint,
+                eyebrow=content.eyebrow, body=content.body, items=content.items, variant=slot.variant,
+            )
+        elif slot.ref in fallbacks:
+            result[slot.ref] = fallbacks[slot.ref]
+        else:
+            result[slot.ref] = PlanBlock(
+                ref=slot.ref, kind=slot.kind, title=slot.title_hint,
+                body="This section could not be completed. Try asking to continue it.", variant=slot.variant,
+            )
+    return result
 
 
 def _title_from_query(query: str) -> str:
@@ -362,21 +353,3 @@ def fallback_plan(session: Session, request: InteractionRequest) -> CanvasPlan:
         layout="editorial",
         blocks=blocks,
     )
-
-
-async def make_plan(session: Session, request: InteractionRequest) -> tuple[CanvasPlan, str]:
-    try:
-        plan = await anthropic_plan(session, request)
-        if plan:
-            focused = session.get(Artifact, request.context.focused_artifact_id) if request.context.focused_artifact_id else None
-            # Keep the product introduction pristine even if a model mistakes
-            # visual focus for conversational continuity. Preserve the useful
-            # generated composition while overriding only its spatial intent.
-            if focused and focused.kind == "welcome" and plan.mode != "new":
-                plan = plan.model_copy(update={"mode": "new", "target_artifact_id": None, "updates": []})
-            return plan, "claude"
-    except (httpx.HTTPError, ValueError) as exc:
-        logger.warning("Anthropic planner unavailable: %s", type(exc).__name__)
-        if os.getenv("NONOTES_STRICT_MODEL") == "1":
-            raise
-    return fallback_plan(session, request), "local"

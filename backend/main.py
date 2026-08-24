@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
+import time
 from collections.abc import AsyncIterator
 from html import escape
 
@@ -18,7 +20,7 @@ try:
         store_artifact_embedding, utcnow, write_revision,
     )
     from .embeddings import generate_embedding
-    from .planner import fill_outline_block, make_outline
+    from .planner import fill_outline_blocks, make_outline
     from .schemas import BlockItem, InteractionRequest, OutlineBlock, OutlineUpdate, PlanBlock
 except ImportError:
     from database import (
@@ -27,10 +29,11 @@ except ImportError:
         store_artifact_embedding, utcnow, write_revision,
     )
     from embeddings import generate_embedding
-    from planner import fill_outline_block, make_outline
+    from planner import fill_outline_blocks, make_outline
     from schemas import BlockItem, InteractionRequest, OutlineBlock, OutlineUpdate, PlanBlock
 
 app = FastAPI(title="No Notes API", version="0.2.0")
+logger = logging.getLogger(__name__)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173", "http://127.0.0.1:5173", "http://localhost:5181", "http://127.0.0.1:5181"],
@@ -131,28 +134,45 @@ def _new_region(session: Session, artifact_id: str, layout: str) -> ArtifactRegi
 
 @app.post("/interactions")
 async def interact(request: InteractionRequest) -> StreamingResponse:
-    return StreamingResponse(_interaction_stream(request), media_type="application/x-ndjson")
+    return StreamingResponse(
+        _interaction_stream(request),
+        media_type="application/x-ndjson",
+        headers={"cache-control": "no-cache, no-transform", "x-accel-buffering": "no"},
+    )
 
 
 async def _interaction_stream(request: InteractionRequest) -> AsyncIterator[str]:
     run_id = new_id("run")
     seq = 0
+    run_started = time.perf_counter()
+    timings: dict[str, int] = {}
+
+    def mark(stage: str, started: float) -> int:
+        duration = round((time.perf_counter() - started) * 1000)
+        timings[stage] = duration
+        logger.info(json.dumps({"level": "info", "message": "latency.stage", "run_id": run_id, "stage": stage, "duration_ms": duration}))
+        return duration
 
     def event(name: str, payload: dict) -> str:
         nonlocal seq
         seq += 1
         return json.dumps({"event": name, "seq": seq, "run_id": run_id, "payload": payload}, default=str) + "\n"
 
+    stage_started = time.perf_counter()
     with Session(engine) as session:
         session.add(InteractionRun(id=run_id, canvas_id=request.context.canvas_id, message=request.message, focused_artifact_id=request.context.focused_artifact_id, context=request.context.model_dump()))
         session.commit()
 
     yield event("run.started", {"message": request.message})
+    yield event("latency.stage", {"stage": "run.persistence", "duration_ms": mark("run.persistence", stage_started)})
     yield event("context.selected", {"label": "Sketching the shape of this"})
 
     try:
         with Session(engine) as session:
+            stage_started = time.perf_counter()
             outline, planner, fallbacks, retrieval = await make_outline(session, request)
+            yield event("latency.stage", {"stage": "outline", "duration_ms": mark("outline", stage_started)})
+            stage_started = time.perf_counter()
             run = session.get(InteractionRun, run_id)
             assert run
             run.behavior = outline.mode
@@ -211,19 +231,25 @@ async def _interaction_stream(request: InteractionRequest) -> AsyncIterator[str]
             size_adjustment = sum(100 if slot.size == "large" else -45 if slot.size == "compact" else 0 for slot, *_ in slots)
             region.height = max(region.height, 340 + total_blocks * 205 + size_adjustment)
             session.commit()
+            mark("outline.persistence", stage_started)
             yield event("outline.committed", {"artifact": serialize_artifact(artifact, region), "block_ids": focus_ids})
             yield event("viewport.focus_requested", {"artifact_id": artifact.id, "block_ids": focus_ids, "transition": transition})
 
-            async def fill(slot: OutlineBlock | OutlineUpdate, block_id: str, existing: dict | None, replacing: bool):
-                content = await fill_outline_block(
-                    request, artifact.title, artifact.summary, slot, existing,
-                    planner, fallbacks.get(slot.ref),
-                )
-                return slot, block_id, replacing, content
+            embedding_task = None
+            if session.bind and session.bind.dialect.name == "postgresql" and outline.mode != "navigate":
+                embedding_source = f"{artifact.title}\n{artifact.summary}\n{request.message}"
+                embedding_task = asyncio.create_task(generate_embedding(embedding_source))
 
-            tasks = [asyncio.create_task(fill(*slot)) for slot in slots]
-            for completed in asyncio.as_completed(tasks):
-                slot, block_id, replacing, content = await completed
+            stage_started = time.perf_counter()
+            generated = await fill_outline_blocks(
+                request, artifact.title, artifact.summary,
+                [(slot, existing) for slot, _, existing, _ in slots], planner, fallbacks,
+            )
+            yield event("latency.stage", {"stage": "content", "duration_ms": mark("content", stage_started)})
+
+            stage_started = time.perf_counter()
+            for slot, block_id, _, replacing in slots:
+                content = generated[slot.ref]
                 block = session.get(ArtifactBlock, block_id)
                 if not block:
                     continue
@@ -246,21 +272,31 @@ async def _interaction_stream(request: InteractionRequest) -> AsyncIterator[str]
                     await asyncio.sleep(0)
                 session.commit()
                 yield event("block.committed", {"block_id": block.id})
+            mark("content.persistence", stage_started)
 
             if not focus_ids:
                 focus_ids = [block.id for block in session.scalars(select(ArtifactBlock).where(ArtifactBlock.artifact_id == artifact.id))]
             write_revision(session, artifact.id, run_id)
             embedding_text = artifact_embedding_text(session, artifact)
-            embedding = await generate_embedding(embedding_text) if session.bind and session.bind.dialect.name == "postgresql" else None
+            stage_started = time.perf_counter()
+            embedding = await embedding_task if embedding_task else None
             if embedding:
                 store_artifact_embedding(session, artifact.id, embedding_text, embedding)
+            mark("embedding.persistence", stage_started)
             run.status = "completed"
             run.completed_at = utcnow()
             session.commit()
 
             yield event("artifact.committed", {"artifact": serialize_artifact(artifact, region)})
-            yield event("run.completed", {"mode": "new" if is_new else outline.mode, "planner": planner})
+            timings["total"] = round((time.perf_counter() - run_started) * 1000)
+            logger.info(json.dumps({"level": "info", "message": "latency.completed", "run_id": run_id, "timings": timings}))
+            yield event("run.completed", {"mode": "new" if is_new else outline.mode, "planner": planner, "timings": timings})
     except Exception as exc:
+        timings["total"] = round((time.perf_counter() - run_started) * 1000)
+        logger.exception(json.dumps({
+            "level": "error", "message": "latency.failed", "run_id": run_id,
+            "error": type(exc).__name__, "timings": timings,
+        }))
         with Session(engine) as session:
             run = session.get(InteractionRun, run_id)
             if run:

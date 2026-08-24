@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 import logging
 import os
+import time
 
 import httpx
 
@@ -26,8 +28,11 @@ async def generate_embedding(text: str) -> list[float] | None:
         "authorization": f"Bearer {SUPABASE_ANON_KEY}",
         "content-type": "application/json",
     }
+    started = time.perf_counter()
+    succeeded = False
     try:
-        async with httpx.AsyncClient(timeout=12) as client:
+        timeout = httpx.Timeout(7, connect=3, write=3, pool=3)
+        async with httpx.AsyncClient(timeout=timeout) as client:
             response = await client.post(
                 f"{SUPABASE_URL}/functions/v1/embed",
                 headers=headers,
@@ -36,7 +41,13 @@ async def generate_embedding(text: str) -> list[float] | None:
             response.raise_for_status()
         embedding = response.json().get("embedding")
         if isinstance(embedding, list) and len(embedding) == 384:
+            succeeded = True
             return [float(item) for item in embedding]
     except (httpx.HTTPError, TypeError, ValueError) as exc:
         logger.warning("Semantic embedding unavailable: %s", type(exc).__name__)
+    finally:
+        logger.info(json.dumps({
+            "level": "info", "message": "latency.stage", "stage": "embedding.remote",
+            "duration_ms": round((time.perf_counter() - started) * 1000), "available": succeeded,
+        }))
     return None

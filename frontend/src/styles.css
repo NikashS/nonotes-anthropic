@@ -51,6 +51,7 @@ button { color: inherit; }
   content-visibility: auto;
   contain-intrinsic-size: 980px 760px;
 }
+.artifact-region.is-current { content-visibility: visible; }
 .artifact-content { display: flex; flex-wrap: wrap; gap: 38px 30px; align-items: flex-start; }
 
 .gen-block {

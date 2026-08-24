@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { ArrowLeft, CornerDownLeft, LoaderCircle, LocateFixed, Sparkles } from 'lucide-react'
 import { loadCanvas, runInteraction } from './api'
+import { cameraForWorldBounds } from './camera'
 import { SpatialCanvas } from './SpatialCanvas'
 import { starterArtifact, starterBlocks } from './starter'
 import type { Artifact, ArtifactBlock, InteractionContext, StreamEvent, Viewport } from './types'
@@ -14,16 +15,13 @@ const suggestions = [
 const focusStorageKey = (canvasId: string) => `nonotes:focus:${canvasId}`
 
 function cameraForArtifact(artifact: Artifact): Viewport {
-  const viewportWidth = window.innerWidth
-  const topInset = 68
-  const bottomInset = 170
-  const availableHeight = window.innerHeight - topInset - bottomInset
-  const zoom = Math.min(1.05, Math.max(0.3, Math.min((viewportWidth - 140) / artifact.width, availableHeight / artifact.height) * 0.96))
-  return {
-    x: viewportWidth / 2 - (artifact.x + artifact.width / 2) * zoom,
-    y: topInset + availableHeight / 2 - (artifact.y + artifact.height / 2) * zoom,
-    zoom,
-  }
+  return cameraForWorldBounds(
+    { left: artifact.x, top: artifact.y, width: artifact.width, height: artifact.height },
+    window.innerWidth,
+    window.innerHeight,
+    0.3,
+    0.96,
+  )
 }
 
 export default function App() {
@@ -33,6 +31,7 @@ export default function App() {
   const [camera, setCamera] = useState<Viewport>(() => cameraForArtifact(starterArtifact))
   const [focusedArtifactId, setFocusedArtifactId] = useState<string>(starterArtifact.id)
   const [focusedBlockIds, setFocusedBlockIds] = useState<string[]>([starterBlocks[0].id])
+  const [focusTarget, setFocusTarget] = useState<{ artifactId: string; blockIds: string[]; requestId: number }>()
   const [focusHistory, setFocusHistory] = useState<string[]>([])
   const [streamingIds, setStreamingIds] = useState(new Set<string>())
   const [transitionPhase, setTransitionPhase] = useState<'idle' | 'blur' | 'moving'>('idle')
@@ -75,7 +74,7 @@ export default function App() {
     setArtifacts(next)
   }, [])
 
-  const focusArtifact = useCallback((artifactId: string, remember = true) => {
+  const focusArtifact = useCallback((artifactId: string, remember = true, moveCamera = true) => {
     const artifact = artifactsRef.current.find((item) => item.id === artifactId)
     if (!artifact) return
     if (remember) {
@@ -87,22 +86,26 @@ export default function App() {
       setFocusedArtifactId(artifactId)
     }
     window.localStorage.setItem(focusStorageKey(canvasId), artifactId)
-    setCamera(cameraForArtifact(artifact))
+    if (moveCamera) setCamera(cameraForArtifact(artifact))
   }, [canvasId])
 
   const requestFocus = useCallback((artifactId: string, blockIds: string[], transition: string) => {
     setFocusedBlockIds(blockIds)
+    const focusChangedBlocks = () => {
+      focusArtifact(artifactId, transition === 'topic-shift', false)
+      setFocusTarget((current) => ({ artifactId, blockIds, requestId: (current?.requestId ?? 0) + 1 }))
+    }
     if (transition === 'topic-shift') {
       setTransitionPhase('blur')
       const moveTimer = window.setTimeout(() => {
         setTransitionPhase('moving')
-        focusArtifact(artifactId)
+        focusChangedBlocks()
       }, 180)
       const revealTimer = window.setTimeout(() => setTransitionPhase('idle'), 820)
       timersRef.current.push(moveTimer, revealTimer)
     } else {
       setTransitionPhase('idle')
-      focusArtifact(artifactId, false)
+      focusChangedBlocks()
     }
   }, [focusArtifact])
 
@@ -211,6 +214,7 @@ export default function App() {
         camera={camera}
         focusedArtifactId={focusedArtifactId}
         focusedBlockIds={focusedBlockIds}
+        focusTarget={focusTarget}
         streamingIds={streamingIds}
         transitionPhase={transitionPhase}
         onCameraChange={setCamera}

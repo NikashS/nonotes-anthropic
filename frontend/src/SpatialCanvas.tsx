@@ -1,5 +1,6 @@
-import { memo, useCallback, useEffect, useMemo, useRef, type PointerEvent } from 'react'
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, type PointerEvent } from 'react'
 import { Minus, Plus, Scan } from 'lucide-react'
+import { cameraForWorldBounds } from './camera'
 import { GenerativeBlock } from './GenerativeBlock'
 import type { Artifact, ArtifactBlock, Viewport } from './types'
 
@@ -9,6 +10,7 @@ type Props = {
   camera: Viewport
   focusedArtifactId?: string
   focusedBlockIds: string[]
+  focusTarget?: { artifactId: string; blockIds: string[]; requestId: number }
   streamingIds: Set<string>
   transitionPhase: 'idle' | 'blur' | 'moving'
   onCameraChange: (camera: Viewport) => void
@@ -16,7 +18,7 @@ type Props = {
 }
 
 export const SpatialCanvas = memo(function SpatialCanvas({
-  artifacts, blocks, camera, focusedArtifactId, focusedBlockIds, streamingIds,
+  artifacts, blocks, camera, focusedArtifactId, focusedBlockIds, focusTarget, streamingIds,
   transitionPhase, onCameraChange, onFocusArtifact,
 }: Props) {
   const viewportRef = useRef<HTMLDivElement>(null)
@@ -32,6 +34,38 @@ export const SpatialCanvas = memo(function SpatialCanvas({
     cameraRef.current = next
     onCameraChangeRef.current(next)
   }, [])
+
+  useLayoutEffect(() => {
+    const viewport = viewportRef.current
+    if (!viewport || !focusTarget?.blockIds.length) return
+
+    const frame = window.requestAnimationFrame(() => {
+      const wanted = new Set(focusTarget.blockIds)
+      const elements = [...viewport.querySelectorAll<HTMLElement>('[data-block-id]')]
+        .filter((element) => (
+          wanted.has(element.dataset.blockId ?? '')
+          && element.closest<HTMLElement>('[data-artifact-id]')?.dataset.artifactId === focusTarget.artifactId
+        ))
+      if (!elements.length) return
+
+      const viewportRect = viewport.getBoundingClientRect()
+      const current = cameraRef.current
+      const rects = elements.map((element) => element.getBoundingClientRect())
+      const left = Math.min(...rects.map((rect) => (rect.left - viewportRect.left - current.x) / current.zoom))
+      const top = Math.min(...rects.map((rect) => (rect.top - viewportRect.top - current.y) / current.zoom))
+      const right = Math.max(...rects.map((rect) => (rect.right - viewportRect.left - current.x) / current.zoom))
+      const bottom = Math.max(...rects.map((rect) => (rect.bottom - viewportRect.top - current.y) / current.zoom))
+
+      commitCamera(cameraForWorldBounds(
+        { left, top, width: right - left, height: bottom - top },
+        viewportRect.width,
+        viewportRect.height,
+        0.46,
+      ))
+    })
+
+    return () => window.cancelAnimationFrame(frame)
+  }, [commitCamera, focusTarget])
 
   const zoomAtPoint = useCallback((nextZoom: number, clientX: number, clientY: number) => {
     const viewport = viewportRef.current

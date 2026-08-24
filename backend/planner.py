@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -38,12 +39,14 @@ OUTLINE_TOOL = {
     "name": "outline_artifact",
     "description": "Choose the stable spatial structure for an artifact before its content is generated.",
     "input_schema": CanvasOutline.model_json_schema(),
+    "eager_input_streaming": True,
 }
 
 CONTENT_TOOL = {
     "name": "fill_blocks",
     "description": "Write concise content for every predefined visual block in one response.",
     "input_schema": GeneratedBlockBatch.model_json_schema(),
+    "eager_input_streaming": True,
 }
 
 logger = logging.getLogger(__name__)
@@ -121,20 +124,42 @@ async def _call_tool(system: str, tool: dict, prompt: str, max_tokens: int, time
         "tools": [tool],
         "tool_choice": {"type": "tool", "name": tool["name"]},
         "messages": [{"role": "user", "content": prompt}],
+        "stream": True,
     }
     headers = {"x-api-key": api_key, "anthropic-version": "2023-06-01", "content-type": "application/json"}
     started = time.perf_counter()
     try:
-        timeout = httpx.Timeout(timeout_seconds, connect=5, write=5, pool=5)
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            response = await client.post("https://api.anthropic.com/v1/messages", headers=headers, json=payload)
-            response.raise_for_status()
+        tool_index: int | None = None
+        partial_json: list[str] = []
+        initial_input: dict | None = None
+        timeout = httpx.Timeout(10, connect=5, write=5, pool=5)
+        async with asyncio.timeout(timeout_seconds):
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                async with client.stream("POST", "https://api.anthropic.com/v1/messages", headers=headers, json=payload) as response:
+                    response.raise_for_status()
+                    async for line in response.aiter_lines():
+                        if not line.startswith("data: "):
+                            continue
+                        data = json.loads(line[6:])
+                        if data.get("type") == "error":
+                            raise ValueError(data.get("error", {}).get("message", "Anthropic stream failed"))
+                        if data.get("type") == "content_block_start":
+                            block = data.get("content_block", {})
+                            if block.get("type") == "tool_use" and block.get("name") == tool["name"]:
+                                tool_index = data.get("index")
+                                if isinstance(block.get("input"), dict) and block["input"]:
+                                    initial_input = block["input"]
+                        elif data.get("type") == "content_block_delta" and data.get("index") == tool_index:
+                            delta = data.get("delta", {})
+                            if delta.get("type") == "input_json_delta":
+                                partial_json.append(delta.get("partial_json", ""))
+        if partial_json:
+            return json.loads("".join(partial_json))
+        if initial_input is not None:
+            return initial_input
+        raise ValueError(f"Claude did not call {tool['name']}")
     finally:
         _log_timing(f"anthropic.{tool['name']}", started, max_tokens=max_tokens)
-    for block in response.json().get("content", []):
-        if block.get("type") == "tool_use" and block.get("name") == tool["name"]:
-            return block["input"]
-    raise ValueError(f"Claude did not call {tool['name']}")
 
 
 async def anthropic_outline(session: Session, request: InteractionRequest) -> tuple[CanvasOutline, dict]:
@@ -197,7 +222,7 @@ async def make_outline(session: Session, request: InteractionRequest) -> tuple[C
         if outline.mode != "new" and (not target or target.kind == "welcome" or target.id not in retrieved_ids):
             outline = outline.model_copy(update={"mode": "new", "target_artifact_id": None, "updates": []})
         return outline, "claude", {}, retrieval
-    except (httpx.HTTPError, ValueError) as exc:
+    except (httpx.HTTPError, TimeoutError, ValueError) as exc:
         logger.warning("Anthropic outline unavailable: %s", type(exc).__name__)
         if os.getenv("NONOTES_STRICT_MODEL") == "1":
             raise
@@ -236,7 +261,7 @@ For diagrams and processes, each item is a node or step. For comparisons, each i
         raw = await _call_tool(system, CONTENT_TOOL, prompt, min(1800, 420 + len(slots) * 340), 22)
         batch = GeneratedBlockBatch.model_validate(raw)
         generated = {item.ref: item.content for item in batch.blocks}
-    except (httpx.HTTPError, ValueError) as exc:
+    except (httpx.HTTPError, TimeoutError, ValueError) as exc:
         logger.warning("Anthropic batch generation unavailable: %s", type(exc).__name__)
         generated = {}
 

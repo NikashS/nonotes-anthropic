@@ -1,4 +1,4 @@
-import { memo, useCallback, useMemo, useRef, type PointerEvent, type WheelEvent } from 'react'
+import { memo, useCallback, useEffect, useMemo, useRef, type PointerEvent } from 'react'
 import { Minus, Plus, Scan } from 'lucide-react'
 import { GenerativeBlock } from './GenerativeBlock'
 import type { Artifact, ArtifactBlock, Viewport } from './types'
@@ -19,7 +19,102 @@ export const SpatialCanvas = memo(function SpatialCanvas({
   artifacts, blocks, camera, focusedArtifactId, focusedBlockIds, streamingIds,
   transitionPhase, onCameraChange, onFocusArtifact,
 }: Props) {
+  const viewportRef = useRef<HTMLDivElement>(null)
   const drag = useRef<{ pointerId: number; x: number; y: number; cameraX: number; cameraY: number } | undefined>(undefined)
+  const cameraRef = useRef(camera)
+  const onCameraChangeRef = useRef(onCameraChange)
+  const gestureStartZoomRef = useRef(camera.zoom)
+
+  useEffect(() => { cameraRef.current = camera }, [camera])
+  useEffect(() => { onCameraChangeRef.current = onCameraChange }, [onCameraChange])
+
+  const commitCamera = useCallback((next: Viewport) => {
+    cameraRef.current = next
+    onCameraChangeRef.current(next)
+  }, [])
+
+  const zoomAtPoint = useCallback((nextZoom: number, clientX: number, clientY: number) => {
+    const viewport = viewportRef.current
+    if (!viewport) return
+    const current = cameraRef.current
+    const zoom = Math.min(1.45, Math.max(0.28, nextZoom))
+    const rect = viewport.getBoundingClientRect()
+    const pointX = clientX - rect.left
+    const pointY = clientY - rect.top
+    const ratio = zoom / current.zoom
+    commitCamera({
+      x: pointX - (pointX - current.x) * ratio,
+      y: pointY - (pointY - current.y) * ratio,
+      zoom,
+    })
+  }, [commitCamera])
+
+  const zoomAtCenter = useCallback((nextZoom: number) => {
+    const rect = viewportRef.current?.getBoundingClientRect()
+    if (!rect) return
+    zoomAtPoint(nextZoom, rect.left + rect.width / 2, rect.top + rect.height / 2)
+  }, [zoomAtPoint])
+
+  useEffect(() => {
+    const viewport = viewportRef.current
+    if (!viewport) return
+
+    const onWheel = (event: globalThis.WheelEvent) => {
+      const target = event.target
+      const isOverCanvas = target instanceof Node && viewport.contains(target)
+      const isZoomGesture = event.ctrlKey || event.metaKey
+      if (!isZoomGesture && !isOverCanvas) return
+
+      event.preventDefault()
+      if (isZoomGesture) {
+        zoomAtPoint(cameraRef.current.zoom * Math.exp(-event.deltaY * 0.002), event.clientX, event.clientY)
+        return
+      }
+      const current = cameraRef.current
+      commitCamera({ ...current, x: current.x - event.deltaX, y: current.y - event.deltaY })
+    }
+
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (!event.ctrlKey && !event.metaKey) return
+      if (!["+", "=", "-", "_", "0"].includes(event.key)) return
+      event.preventDefault()
+      if (event.key === "0") {
+        zoomAtCenter(1)
+      } else {
+        zoomAtCenter(cameraRef.current.zoom * (["+", "="].includes(event.key) ? 1.14 : 0.88))
+      }
+    }
+
+    type SafariGestureEvent = Event & { scale?: number; clientX?: number; clientY?: number }
+    const onGestureStart = (event: Event) => {
+      event.preventDefault()
+      gestureStartZoomRef.current = cameraRef.current.zoom
+    }
+    const onGestureChange = (event: Event) => {
+      event.preventDefault()
+      const gesture = event as SafariGestureEvent
+      const rect = viewport.getBoundingClientRect()
+      zoomAtPoint(
+        gestureStartZoomRef.current * (gesture.scale ?? 1),
+        gesture.clientX ?? rect.left + rect.width / 2,
+        gesture.clientY ?? rect.top + rect.height / 2,
+      )
+    }
+    const preventGestureEnd = (event: Event) => event.preventDefault()
+
+    window.addEventListener('wheel', onWheel, { passive: false, capture: true })
+    window.addEventListener('keydown', onKeyDown)
+    window.addEventListener('gesturestart', onGestureStart, { passive: false })
+    window.addEventListener('gesturechange', onGestureChange, { passive: false })
+    window.addEventListener('gestureend', preventGestureEnd, { passive: false })
+    return () => {
+      window.removeEventListener('wheel', onWheel, true)
+      window.removeEventListener('keydown', onKeyDown)
+      window.removeEventListener('gesturestart', onGestureStart)
+      window.removeEventListener('gesturechange', onGestureChange)
+      window.removeEventListener('gestureend', preventGestureEnd)
+    }
+  }, [commitCamera, zoomAtCenter, zoomAtPoint])
   const blocksByArtifact = useMemo(() => {
     const grouped = new Map<string, ArtifactBlock[]>()
     for (const block of blocks) {
@@ -45,30 +140,19 @@ export const SpatialCanvas = memo(function SpatialCanvas({
 
   const stopDrag = useCallback(() => { drag.current = undefined }, [])
 
-  const onWheel = useCallback((event: WheelEvent<HTMLDivElement>) => {
-    event.preventDefault()
-    if (event.ctrlKey || event.metaKey) {
-      const nextZoom = Math.min(1.45, Math.max(0.28, camera.zoom * Math.exp(-event.deltaY * 0.002)))
-      const ratio = nextZoom / camera.zoom
-      onCameraChange({ x: event.clientX - (event.clientX - camera.x) * ratio, y: event.clientY - (event.clientY - camera.y) * ratio, zoom: nextZoom })
-    } else {
-      onCameraChange({ ...camera, x: camera.x - event.deltaX, y: camera.y - event.deltaY })
-    }
-  }, [camera, onCameraChange])
-
   const zoomBy = useCallback((factor: number) => {
-    onCameraChange({ ...camera, zoom: Math.min(1.45, Math.max(0.28, camera.zoom * factor)) })
-  }, [camera, onCameraChange])
+    zoomAtCenter(cameraRef.current.zoom * factor)
+  }, [zoomAtCenter])
 
   return (
     <div
+      ref={viewportRef}
       className="canvas-viewport"
       aria-label="Spatial knowledge canvas"
       onPointerDown={onPointerDown}
       onPointerMove={onPointerMove}
       onPointerUp={stopDrag}
       onPointerCancel={stopDrag}
-      onWheel={onWheel}
     >
       <div
         className={`world-layer topic-${transitionPhase}`}

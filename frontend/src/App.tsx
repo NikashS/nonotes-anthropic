@@ -133,6 +133,11 @@ export default function App() {
         setStreamingIds((current) => new Set(current).add(block.id))
         break
       }
+      case 'blocks.reordered': {
+        const reordered = new Map((payload.blocks as ArtifactBlock[]).map((block) => [block.id, block]))
+        setBlocks((current) => current.map((block) => reordered.get(block.id) ?? block))
+        break
+      }
       case 'block.html_delta': {
         const id = String(payload.block_id)
         const html = String(payload.html ?? '')

@@ -204,6 +204,7 @@ async def _interaction_stream(request: InteractionRequest) -> AsyncIterator[str]
             next_order = (next_order + 1) if next_order is not None else 0
             slots: list[tuple[OutlineBlock | OutlineUpdate, str, dict | None, bool]] = []
             focus_ids: list[str] = []
+            reordered_blocks: list[ArtifactBlock] = []
 
             anchor = session.get(ArtifactBlock, outline.insert_after_block_id) if outline.insert_after_block_id else None
             if anchor and anchor.artifact_id == artifact.id and outline.blocks:
@@ -215,7 +216,11 @@ async def _interaction_stream(request: InteractionRequest) -> AsyncIterator[str]
                 ))
                 for existing in following:
                     existing.order += len(outline.blocks)
+                reordered_blocks = following
                 session.flush()
+
+            if reordered_blocks:
+                yield event("blocks.reordered", {"blocks": [serialize_block(block) for block in reordered_blocks]})
 
             for update in outline.updates:
                 block = session.get(ArtifactBlock, update.block_id)

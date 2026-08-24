@@ -163,6 +163,9 @@ def test_related_follow_up_is_inserted_after_the_relevant_block() -> None:
         session.commit()
 
     result = interaction("Who discovered the light-clock thought experiment?", artifact_id)
+    reordered_event = next(index for index, line in enumerate(result["events"]) if '"event": "blocks.reordered"' in line)
+    outlined_event = next(index for index, line in enumerate(result["events"]) if '"event": "block.outlined"' in line)
+    assert reordered_event < outlined_event
     committed = next(json.loads(line) for line in result["events"] if '"event": "outline.committed"' in line)
     assert committed["payload"]["insert_after_block_id"] == light_clock_id
 

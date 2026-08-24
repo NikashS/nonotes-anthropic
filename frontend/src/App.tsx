@@ -214,11 +214,13 @@ export default function App() {
 
       <header className="topbar">
         <div className="brand"><span>No Notes</span><i /></div>
-        <div className="focus-chip">
-          {focusHistory.length > 0 ? <button onClick={goBack} aria-label="Return to previous focus"><ArrowLeft size={14} /></button> : null}
-          <LocateFixed size={13} />
-          <span>{focusedArtifact?.title ?? 'Your knowledge space'}</span>
-        </div>
+        {focusedArtifact?.kind !== 'welcome' ? (
+          <div className="focus-chip">
+            {focusHistory.length > 0 ? <button onClick={goBack} aria-label="Return to previous focus"><ArrowLeft size={14} /></button> : null}
+            <LocateFixed size={13} />
+            <span>{focusedArtifact?.title ?? 'Your knowledge space'}</span>
+          </div>
+        ) : <div />}
         {isRunning && status ? <div className="status working"><LoaderCircle size={13} />{status}</div> : <div />}
       </header>
 

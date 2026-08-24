@@ -81,7 +81,6 @@ export const SpatialCanvas = memo(function SpatialCanvas({
             style={{ left: artifact.x, top: artifact.y, width: artifact.width, minHeight: artifact.height }}
             data-artifact-id={artifact.id}
           >
-            <div className="artifact-corner" aria-hidden="true">{artifact.title}</div>
             <div className="artifact-content">
               {(blocksByArtifact.get(artifact.id) ?? []).map((block) => (
                 <GenerativeBlock key={block.id} block={block} isStreaming={streamingIds.has(block.id)} isFocused={focusedBlockSet.has(block.id)} />

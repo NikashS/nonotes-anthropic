@@ -60,6 +60,11 @@ def test_first_question_leaves_welcome_and_uses_a_new_region() -> None:
     result = interaction("Explain how privacy should work in an AI memory system")
     assert any('"mode": "new"' in line for line in result["events"])
     assert any('"transition": "topic-shift"' in line for line in result["events"])
+    outlined = next(index for index, line in enumerate(result["events"]) if '"event": "block.outlined"' in line)
+    outline_committed = next(index for index, line in enumerate(result["events"]) if '"event": "outline.committed"' in line)
+    content_started = next(index for index, line in enumerate(result["events"]) if '"event": "block.started"' in line)
+    assert outlined < outline_committed < content_started
+    assert '"_outline"' in result["events"][outlined]
     canvas = client.get("/canvas").json()
     welcome_blocks = [block for block in canvas["blocks"] if block["artifact_id"] == "artifact_no_notes"]
     assert len(welcome_blocks) == len(before["blocks"])

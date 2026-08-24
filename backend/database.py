@@ -211,12 +211,14 @@ def init_database() -> None:
                 id="artifact_no_notes",
                 canvas_id="main",
                 kind="welcome",
-                title="The No Notes idea",
+                title="No Notes",
                 summary="A spatial AI workspace that retrieves durable artifacts instead of asking users to find old chats.",
             )
             session.add(artifact)
         elif artifact.kind != "welcome":
             artifact.kind = "welcome"
+        if artifact.title == "The No Notes idea":
+            artifact.title = "No Notes"
         region = session.get(ArtifactRegion, artifact.id)
         if not region:
             session.add(ArtifactRegion(artifact_id=artifact.id, x=40, y=20, width=1040, height=900, layout="editorial", accent="moss"))

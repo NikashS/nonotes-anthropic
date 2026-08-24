@@ -16,15 +16,15 @@ try:
         Artifact, ArtifactBlock, ArtifactRegion, InteractionRun, canvas_snapshot,
         engine, new_id, serialize_artifact, serialize_block, utcnow, write_revision,
     )
-    from .planner import make_plan
-    from .schemas import BlockItem, InteractionRequest, PlanBlock
+    from .planner import fill_outline_block, make_outline
+    from .schemas import BlockItem, InteractionRequest, OutlineBlock, OutlineUpdate, PlanBlock
 except ImportError:
     from database import (
         Artifact, ArtifactBlock, ArtifactRegion, InteractionRun, canvas_snapshot,
         engine, new_id, serialize_artifact, serialize_block, utcnow, write_revision,
     )
-    from planner import make_plan
-    from schemas import BlockItem, InteractionRequest, PlanBlock
+    from planner import fill_outline_block, make_outline
+    from schemas import BlockItem, InteractionRequest, OutlineBlock, OutlineUpdate, PlanBlock
 
 app = FastAPI(title="No Notes API", version="0.2.0")
 app.add_middleware(
@@ -89,6 +89,28 @@ def _content(block: PlanBlock) -> dict:
     }
 
 
+def _outline_content(slot: OutlineBlock | OutlineUpdate) -> dict:
+    return {
+        "title": slot.title_hint,
+        "eyebrow": "",
+        "body": "",
+        "items": [],
+        "_outline": {"item_count": slot.item_count, "size": slot.size},
+    }
+
+
+def _skeleton_html(slot: OutlineBlock | OutlineUpdate) -> str:
+    title = f'<h2 class="outline-title">{escape(slot.title_hint)}</h2>' if slot.title_hint and slot.kind != "hero" else ""
+    if slot.kind == "hero":
+        return '<div class="outline-line outline-kicker"></div><div class="outline-line outline-heading"></div><div class="outline-line outline-copy"></div>'
+    if slot.kind in {"process", "diagram", "comparison", "timeline", "metrics"}:
+        items = "".join('<i class="outline-item"></i>' for _ in range(max(slot.item_count, 3)))
+        return title + f'<div class="outline-visual">{items}</div>'
+    if slot.kind == "callout":
+        return title + '<div class="outline-line outline-copy"></div><div class="outline-line outline-short"></div>'
+    return title + '<div class="outline-line outline-copy"></div><div class="outline-line outline-copy"></div><div class="outline-line outline-short"></div>'
+
+
 def _new_region(session: Session, artifact_id: str, layout: str) -> ArtifactRegion:
     farthest = session.scalar(select(func.max(ArtifactRegion.x + ArtifactRegion.width))) or 0
     count = session.scalar(select(func.count()).select_from(ArtifactRegion)) or 0
@@ -122,83 +144,104 @@ async def _interaction_stream(request: InteractionRequest) -> AsyncIterator[str]
         session.commit()
 
     yield event("run.started", {"message": request.message})
-    yield event("context.selected", {"label": "Finding the right place for this"})
+    yield event("context.selected", {"label": "Sketching the shape of this"})
 
     try:
         with Session(engine) as session:
-            plan, planner = await make_plan(session, request)
+            outline, planner, fallbacks = await make_outline(session, request)
             run = session.get(InteractionRun, run_id)
             assert run
-            run.behavior = plan.mode
+            run.behavior = outline.mode
 
-            artifact = session.get(Artifact, plan.target_artifact_id) if plan.target_artifact_id else None
-            is_new = plan.mode == "new" or not artifact
+            artifact = session.get(Artifact, outline.target_artifact_id) if outline.target_artifact_id else None
+            is_new = outline.mode == "new" or not artifact
             if is_new:
-                artifact = Artifact(id=new_id("artifact"), canvas_id=request.context.canvas_id, title=plan.title, summary=plan.summary)
+                artifact = Artifact(id=new_id("artifact"), canvas_id=request.context.canvas_id, title=outline.title, summary=outline.summary)
                 session.add(artifact)
                 session.flush()
-                region = _new_region(session, artifact.id, plan.layout)
+                region = _new_region(session, artifact.id, outline.layout)
                 session.add(region)
             else:
                 region = session.get(ArtifactRegion, artifact.id)
                 if not region:
                     region = ArtifactRegion(artifact_id=artifact.id)
                     session.add(region)
-                if plan.mode == "modify" and plan.title:
-                    artifact.title = plan.title
-                artifact.summary = plan.summary or artifact.summary
+                if outline.mode == "modify" and outline.title:
+                    artifact.title = outline.title
+                artifact.summary = outline.summary or artifact.summary
                 artifact.updated_at = utcnow()
             session.flush()
 
             transition = "topic-shift" if is_new else "continuation"
-            yield event("artifact.started", {"artifact": serialize_artifact(artifact, region), "mode": "new" if is_new else plan.mode, "transition": transition})
-
-            focus_ids: list[str] = []
-            for update in plan.updates:
-                block = session.get(ArtifactBlock, update.block_id)
-                if not block or block.artifact_id != artifact.id:
-                    continue
-                current = block.content or {}
-                items = update.items or [BlockItem.model_validate(item) for item in current.get("items", [])]
-                title = update.title or current.get("title", "")
-                eyebrow = update.eyebrow or current.get("eyebrow", "")
-                body = update.body or current.get("body", "")
-                block.content = {"title": title, "eyebrow": eyebrow, "body": body, "items": [item.model_dump() for item in items]}
-                block.variant = update.variant or block.variant
-                block.html = ""
-                block.revision += 1
-                focus_ids.append(block.id)
-                session.flush()
-                yield event("block.started", {"block": serialize_block(block), "replacing": True})
-                for fragment in _compile_fragments(block.kind, title, eyebrow, body, items):
-                    if not fragment:
-                        continue
-                    block.html += fragment
-                    yield event("block.html_delta", {"block_id": block.id, "html": fragment})
-                    await asyncio.sleep(0.045)
-                yield event("block.committed", {"block_id": block.id})
+            yield event("artifact.started", {"artifact": serialize_artifact(artifact, region), "mode": "new" if is_new else outline.mode, "transition": transition})
 
             next_order = session.scalar(select(func.max(ArtifactBlock.order)).where(ArtifactBlock.artifact_id == artifact.id))
             next_order = (next_order + 1) if next_order is not None else 0
-            for index, addition in enumerate(plan.blocks):
+            slots: list[tuple[OutlineBlock | OutlineUpdate, str, dict | None, bool]] = []
+            focus_ids: list[str] = []
+
+            for update in outline.updates:
+                block = session.get(ArtifactBlock, update.block_id)
+                if not block or block.artifact_id != artifact.id:
+                    continue
+                existing_content = dict(block.content or {})
+                block.content = {**existing_content, "_outline": {"item_count": update.item_count, "size": update.size}}
+                focus_ids.append(block.id)
+                slots.append((update, block.id, existing_content, True))
+                yield event("block.outlined", {"block": serialize_block(block), "replacing": True})
+
+            for index, addition in enumerate(outline.blocks):
                 block = ArtifactBlock(
                     id=new_id("block"), artifact_id=artifact.id, kind=addition.kind,
-                    variant=addition.variant, content=_content(addition), html="", order=next_order + index,
+                    variant=addition.variant, content=_outline_content(addition),
+                    html=_skeleton_html(addition), order=next_order + index,
                 )
                 session.add(block)
                 session.flush()
                 focus_ids.append(block.id)
-                yield event("block.started", {"block": serialize_block(block), "replacing": False})
-                for fragment in _compile_fragments(addition.kind, addition.title, addition.eyebrow, addition.body, addition.items):
+                slots.append((addition, block.id, None, False))
+                yield event("block.outlined", {"block": serialize_block(block), "replacing": False})
+
+            total_blocks = session.scalar(select(func.count()).select_from(ArtifactBlock).where(ArtifactBlock.artifact_id == artifact.id)) or 1
+            size_adjustment = sum(100 if slot.size == "large" else -45 if slot.size == "compact" else 0 for slot, *_ in slots)
+            region.height = max(region.height, 340 + total_blocks * 205 + size_adjustment)
+            session.commit()
+            yield event("outline.committed", {"artifact": serialize_artifact(artifact, region), "block_ids": focus_ids})
+            yield event("viewport.focus_requested", {"artifact_id": artifact.id, "block_ids": focus_ids, "transition": transition})
+
+            async def fill(slot: OutlineBlock | OutlineUpdate, block_id: str, existing: dict | None, replacing: bool):
+                content = await fill_outline_block(
+                    request, artifact.title, artifact.summary, slot, existing,
+                    planner, fallbacks.get(slot.ref),
+                )
+                return slot, block_id, replacing, content
+
+            tasks = [asyncio.create_task(fill(*slot)) for slot in slots]
+            for completed in asyncio.as_completed(tasks):
+                slot, block_id, replacing, content = await completed
+                block = session.get(ArtifactBlock, block_id)
+                if not block:
+                    continue
+                block.kind = slot.kind
+                block.variant = slot.variant
+                block.content = {
+                    **_content(content),
+                    "_outline": {"item_count": slot.item_count, "size": slot.size},
+                }
+                block.html = ""
+                if replacing:
+                    block.revision += 1
+                session.flush()
+                yield event("block.started", {"block": serialize_block(block), "replacing": replacing})
+                for fragment in _compile_fragments(content.kind, content.title, content.eyebrow, content.body, content.items):
                     if not fragment:
                         continue
                     block.html += fragment
                     yield event("block.html_delta", {"block_id": block.id, "html": fragment})
-                    await asyncio.sleep(0.055)
+                    await asyncio.sleep(0)
+                session.commit()
                 yield event("block.committed", {"block_id": block.id})
 
-            total_blocks = session.scalar(select(func.count()).select_from(ArtifactBlock).where(ArtifactBlock.artifact_id == artifact.id)) or 1
-            region.height = max(region.height, 380 + total_blocks * 190)
             if not focus_ids:
                 focus_ids = [block.id for block in session.scalars(select(ArtifactBlock).where(ArtifactBlock.artifact_id == artifact.id))]
             write_revision(session, artifact.id, run_id)
@@ -207,8 +250,7 @@ async def _interaction_stream(request: InteractionRequest) -> AsyncIterator[str]
             session.commit()
 
             yield event("artifact.committed", {"artifact": serialize_artifact(artifact, region)})
-            yield event("viewport.focus_requested", {"artifact_id": artifact.id, "block_ids": focus_ids, "transition": transition})
-            yield event("run.completed", {"label": "Ready", "mode": "new" if is_new else plan.mode, "planner": planner})
+            yield event("run.completed", {"mode": "new" if is_new else outline.mode, "planner": planner})
     except Exception as exc:
         with Session(engine) as session:
             run = session.get(InteractionRun, run_id)

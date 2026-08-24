@@ -11,10 +11,16 @@ from sqlalchemy.orm import Session
 
 try:
     from .database import Artifact, ArtifactBlock, retrieve_artifacts
-    from .schemas import BlockItem, CanvasPlan, InteractionRequest, PlanBlock, PlanUpdate
+    from .schemas import (
+        BlockContent, BlockItem, CanvasOutline, CanvasPlan, InteractionRequest,
+        OutlineBlock, OutlineUpdate, PlanBlock, PlanUpdate,
+    )
 except ImportError:
     from database import Artifact, ArtifactBlock, retrieve_artifacts
-    from schemas import BlockItem, CanvasPlan, InteractionRequest, PlanBlock, PlanUpdate
+    from schemas import (
+        BlockContent, BlockItem, CanvasOutline, CanvasPlan, InteractionRequest,
+        OutlineBlock, OutlineUpdate, PlanBlock, PlanUpdate,
+    )
 
 
 SYSTEM_PROMPT = """You are the generative composition engine for No Notes, an AI interface without chats or threads.
@@ -30,6 +36,26 @@ TOOL = {
     "name": "compose_artifact",
     "description": "Plan targeted edits or additions to a persistent spatial artifact using themed generative UI blocks.",
     "input_schema": CanvasPlan.model_json_schema(),
+}
+
+OUTLINE_PROMPT = """You are the spatial editor for No Notes. Decide where an answer belongs, then return only a compact visual outline.
+The outline is a space contract: choose 3-5 complementary blocks, their order, expected item counts, and size before content is written.
+Use free-standing hero or rich text for explanation. Use a diagram, process, comparison, timeline, or metrics block only when it clarifies a relationship.
+Prefer varied, whiteboard-like compositions over uniform card grids. Keep item_count at 3-5 for visual blocks and zero for prose or callouts.
+Use `large` for heroes and dense timelines/diagrams, `compact` for callouts, and `standard` otherwise.
+The focused artifact is the subject of referential follow-ups. A self-contained new subject creates a separate artifact. A `welcome` artifact is never edited.
+For updates, use only supplied existing block IDs and preserve the block's kind. Do not write the actual answer yet."""
+
+OUTLINE_TOOL = {
+    "name": "outline_artifact",
+    "description": "Choose the stable spatial structure for an artifact before its content is generated.",
+    "input_schema": CanvasOutline.model_json_schema(),
+}
+
+CONTENT_TOOL = {
+    "name": "fill_block",
+    "description": "Write concise content for one predefined visual block.",
+    "input_schema": BlockContent.model_json_schema(),
 }
 
 logger = logging.getLogger(__name__)
@@ -85,6 +111,135 @@ def _validate_plan_input(raw: dict) -> CanvasPlan:
                 for item in items
             ]
     return CanvasPlan.model_validate(raw)
+
+
+async def _call_tool(system: str, tool: dict, prompt: str, max_tokens: int) -> dict:
+    api_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
+    if not api_key:
+        raise ValueError("Anthropic is not configured")
+    payload = {
+        "model": os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-6"),
+        "max_tokens": max_tokens,
+        "system": system,
+        "tools": [tool],
+        "tool_choice": {"type": "tool", "name": tool["name"]},
+        "messages": [{"role": "user", "content": prompt}],
+    }
+    headers = {"x-api-key": api_key, "anthropic-version": "2023-06-01", "content-type": "application/json"}
+    async with httpx.AsyncClient(timeout=45) as client:
+        response = await client.post("https://api.anthropic.com/v1/messages", headers=headers, json=payload)
+        response.raise_for_status()
+    for block in response.json().get("content", []):
+        if block.get("type") == "tool_use" and block.get("name") == tool["name"]:
+            return block["input"]
+    raise ValueError(f"Claude did not call {tool['name']}")
+
+
+async def anthropic_outline(session: Session, request: InteractionRequest) -> CanvasOutline:
+    context = json.dumps(_compact_context(session, request), ensure_ascii=False)
+    raw = await _call_tool(
+        OUTLINE_PROMPT,
+        OUTLINE_TOOL,
+        f"Request: {request.message}\n\nAvailable spatial context:\n{context}",
+        1100,
+    )
+    return CanvasOutline.model_validate(raw)
+
+
+def _outline_from_plan(session: Session, plan: CanvasPlan) -> tuple[CanvasOutline, dict[str, PlanBlock]]:
+    fallback_content: dict[str, PlanBlock] = {}
+    blocks: list[OutlineBlock] = []
+    updates: list[OutlineUpdate] = []
+    for block in plan.blocks:
+        size = "large" if block.kind in {"hero", "diagram", "timeline"} else "compact" if block.kind == "callout" else "standard"
+        blocks.append(OutlineBlock(
+            ref=block.ref, kind=block.kind, title_hint=block.title, variant=block.variant,
+            item_count=len(block.items), size=size,
+        ))
+        fallback_content[block.ref] = block
+    for index, update in enumerate(plan.updates):
+        current = session.get(ArtifactBlock, update.block_id)
+        if not current:
+            continue
+        ref = f"update_{index}"
+        updates.append(OutlineUpdate(
+            ref=ref, block_id=update.block_id, kind=current.kind,
+            title_hint=update.title or (current.content or {}).get("title", ""),
+            variant=update.variant or current.variant,
+            item_count=len(update.items or (current.content or {}).get("items", [])),
+            size="large" if current.kind in {"hero", "diagram", "timeline"} else "compact" if current.kind == "callout" else "standard",
+        ))
+        fallback_content[ref] = PlanBlock(
+            ref=ref, kind=current.kind, title=update.title, eyebrow=update.eyebrow,
+            body=update.body, items=update.items, variant=update.variant or current.variant,
+        )
+    return CanvasOutline(
+        mode=plan.mode, title=plan.title, summary=plan.summary,
+        target_artifact_id=plan.target_artifact_id, layout=plan.layout,
+        blocks=blocks, updates=updates,
+    ), fallback_content
+
+
+async def make_outline(session: Session, request: InteractionRequest) -> tuple[CanvasOutline, str, dict[str, PlanBlock]]:
+    try:
+        outline = await anthropic_outline(session, request)
+        focused = session.get(Artifact, request.context.focused_artifact_id) if request.context.focused_artifact_id else None
+        if focused and focused.kind == "welcome" and outline.mode != "new":
+            outline = outline.model_copy(update={"mode": "new", "target_artifact_id": None, "updates": []})
+        return outline, "claude", {}
+    except (httpx.HTTPError, ValueError) as exc:
+        logger.warning("Anthropic outline unavailable: %s", type(exc).__name__)
+        if os.getenv("NONOTES_STRICT_MODEL") == "1":
+            raise
+    outline, fallback_content = _outline_from_plan(session, fallback_plan(session, request))
+    return outline, "local", fallback_content
+
+
+async def fill_outline_block(
+    request: InteractionRequest,
+    artifact_title: str,
+    artifact_summary: str,
+    slot: OutlineBlock | OutlineUpdate,
+    existing_content: dict | None,
+    planner: str,
+    fallback: PlanBlock | None,
+) -> PlanBlock:
+    if planner == "local" and fallback:
+        return fallback
+    system = """You write one section of a hand-drawn visual explanation. Respect the predefined block kind and footprint exactly.
+Return the requested number of items so the layout does not shift. Be concrete, explanatory, and concise. Avoid generic introductions, UI language, and repeated conclusions.
+For diagrams and processes, each item is a node or step. For comparisons, each item is a meaningful dimension or option. For timelines, each item is a stage. Body text should usually stay under 80 words and item bodies under 24 words."""
+    prompt = json.dumps({
+        "request": request.message,
+        "artifact": {"title": artifact_title, "summary": artifact_summary},
+        "slot": slot.model_dump(),
+        "existing_content": existing_content,
+        "requirements": {
+            "kind": slot.kind,
+            "title_hint": slot.title_hint,
+            "exact_item_count": slot.item_count,
+            "size": slot.size,
+        },
+    }, ensure_ascii=False)
+    try:
+        raw = await _call_tool(system, CONTENT_TOOL, prompt, 900)
+        content = BlockContent.model_validate(raw)
+        if slot.item_count:
+            content.items = content.items[:slot.item_count]
+        else:
+            content.items = []
+        return PlanBlock(
+            ref=slot.ref, kind=slot.kind, title=content.title or slot.title_hint,
+            eyebrow=content.eyebrow, body=content.body, items=content.items, variant=slot.variant,
+        )
+    except (httpx.HTTPError, ValueError) as exc:
+        logger.warning("Anthropic block generation unavailable for %s: %s", slot.ref, type(exc).__name__)
+        if fallback:
+            return fallback
+        return PlanBlock(
+            ref=slot.ref, kind=slot.kind, title=slot.title_hint,
+            body="This section could not be completed. Try asking to continue it.", variant=slot.variant,
+        )
 
 
 def _title_from_query(query: str) -> str:

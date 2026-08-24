@@ -5,9 +5,9 @@ import { SpatialCanvas } from './SpatialCanvas'
 import type { Artifact, ArtifactBlock, InteractionContext, StreamEvent, Viewport } from './types'
 
 const suggestions = [
-  'How does No Notes work?',
-  'Add a privacy layer to this architecture',
-  'Start a separate topic: plan a two-week Japan trip',
+  'Visualize when a relational database beats a document or graph database',
+  'Explain why time slows down near the speed of light',
+  'Map a relaxed ten-day first trip through Japan',
 ]
 
 function cameraForArtifact(artifact: Artifact): Viewport {
@@ -54,7 +54,7 @@ export default function App() {
           setFocusedBlockIds(snapshot.blocks.filter((block) => block.artifact_id === first.id).slice(0, 1).map((block) => block.id))
           setCamera(cameraForArtifact(first))
         }
-        setStatus('Ready')
+        setStatus('')
       })
       .catch((reason) => {
         setError(reason instanceof Error ? reason.message : 'Could not load your space')
@@ -119,6 +119,12 @@ export default function App() {
         setStreamingIds((current) => new Set(current).add(block.id))
         break
       }
+      case 'block.outlined': {
+        const block = payload.block as ArtifactBlock
+        setBlocks((current) => [...current.filter((item) => item.id !== block.id), block])
+        setStreamingIds((current) => new Set(current).add(block.id))
+        break
+      }
       case 'block.html_delta': {
         const id = String(payload.block_id)
         const html = String(payload.html ?? '')
@@ -137,11 +143,15 @@ export default function App() {
       case 'artifact.committed':
         upsertArtifact(payload.artifact as Artifact)
         break
+      case 'outline.committed':
+        upsertArtifact(payload.artifact as Artifact)
+        setStatus('Filling in the sketch…')
+        break
       case 'viewport.focus_requested':
         requestFocus(String(payload.artifact_id), payload.block_ids as string[], String(payload.transition ?? 'continuation'))
         break
       case 'run.completed':
-        setStatus(String(payload.label ?? 'Ready'))
+        setStatus('')
         break
       case 'run.failed':
         setError(String(payload.message ?? 'Something went wrong'))
@@ -209,9 +219,7 @@ export default function App() {
           <LocateFixed size={13} />
           <span>{focusedArtifact?.title ?? 'Your knowledge space'}</span>
         </div>
-        <div className={`status ${isRunning ? 'working' : ''}`}>
-          {isRunning ? <LoaderCircle size={13} /> : null}{status}
-        </div>
+        {isRunning && status ? <div className="status working"><LoaderCircle size={13} />{status}</div> : <div />}
       </header>
 
       <section className="composer-wrap" aria-label="Ask No Notes">

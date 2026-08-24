@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { ArrowLeft, CornerDownLeft, LoaderCircle, LocateFixed, Sparkles } from 'lucide-react'
 import { loadCanvas, runInteraction } from './api'
 import { SpatialCanvas } from './SpatialCanvas'
+import { starterArtifact, starterBlocks } from './starter'
 import type { Artifact, ArtifactBlock, InteractionContext, StreamEvent, Viewport } from './types'
 
 const suggestions = [
@@ -26,12 +27,12 @@ function cameraForArtifact(artifact: Artifact): Viewport {
 }
 
 export default function App() {
-  const [artifacts, setArtifacts] = useState<Artifact[]>([])
-  const [blocks, setBlocks] = useState<ArtifactBlock[]>([])
+  const [artifacts, setArtifacts] = useState<Artifact[]>([starterArtifact])
+  const [blocks, setBlocks] = useState<ArtifactBlock[]>(starterBlocks)
   const [canvasId, setCanvasId] = useState('main')
-  const [camera, setCamera] = useState<Viewport>({ x: 0, y: 0, zoom: 1 })
-  const [focusedArtifactId, setFocusedArtifactId] = useState<string>()
-  const [focusedBlockIds, setFocusedBlockIds] = useState<string[]>([])
+  const [camera, setCamera] = useState<Viewport>(() => cameraForArtifact(starterArtifact))
+  const [focusedArtifactId, setFocusedArtifactId] = useState<string>(starterArtifact.id)
+  const [focusedBlockIds, setFocusedBlockIds] = useState<string[]>([starterBlocks[0].id])
   const [focusHistory, setFocusHistory] = useState<string[]>([])
   const [streamingIds, setStreamingIds] = useState(new Set<string>())
   const [transitionPhase, setTransitionPhase] = useState<'idle' | 'blur' | 'moving'>('idle')
@@ -41,7 +42,7 @@ export default function App() {
   const [error, setError] = useState<string>()
   const abortRef = useRef<AbortController | undefined>(undefined)
   const timersRef = useRef<number[]>([])
-  const artifactsRef = useRef<Artifact[]>([])
+  const artifactsRef = useRef<Artifact[]>([starterArtifact])
 
   useEffect(() => {
     loadCanvas()

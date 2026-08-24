@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 from uuid import uuid4
 
@@ -9,7 +10,7 @@ from sqlalchemy.orm import Session
 
 os.environ["DATABASE_URL"] = f"sqlite:////tmp/nonotes-test-{uuid4().hex}.db"
 
-from backend.database import engine
+from backend.database import Artifact, ArtifactBlock, ArtifactRegion, engine
 from backend.main import _compile_fragments, app
 from backend import planner
 from backend.planner import _validate_plan_input
@@ -141,6 +142,40 @@ def test_follow_up_stream_extends_focused_artifact() -> None:
     assert len([block for block in canvas["blocks"] if block["artifact_id"] == "artifact_no_notes"]) == 4
 
 
+def test_related_follow_up_is_inserted_after_the_relevant_block() -> None:
+    artifact_id = f"artifact_anchor_{uuid4().hex[:8]}"
+    hero_id = f"block_hero_{uuid4().hex[:8]}"
+    light_clock_id = f"block_light_{uuid4().hex[:8]}"
+    orbital_id = f"block_orbit_{uuid4().hex[:8]}"
+    with Session(engine) as session:
+        session.add(Artifact(
+            id=artifact_id,
+            canvas_id="main",
+            title="Why Time Slows Near the Speed of Light",
+            summary="A visual explanation of the light-clock thought experiment and relativity.",
+        ))
+        session.add(ArtifactRegion(artifact_id=artifact_id))
+        session.add_all([
+            ArtifactBlock(id=hero_id, artifact_id=artifact_id, kind="hero", order=0, content={"title": "Time dilation"}),
+            ArtifactBlock(id=light_clock_id, artifact_id=artifact_id, kind="diagram", order=1, content={"title": "The Light-Clock Thought Experiment"}),
+            ArtifactBlock(id=orbital_id, artifact_id=artifact_id, kind="rich_text", order=2, content={"title": "Falling Around the Earth"}),
+        ])
+        session.commit()
+
+    result = interaction("Who discovered the light-clock thought experiment?", artifact_id)
+    committed = next(json.loads(line) for line in result["events"] if '"event": "outline.committed"' in line)
+    assert committed["payload"]["insert_after_block_id"] == light_clock_id
+
+    canvas = client.get("/canvas").json()
+    ordered = sorted(
+        (block for block in canvas["blocks"] if block["artifact_id"] == artifact_id),
+        key=lambda block: block["order"],
+    )
+    inserted_ids = committed["payload"]["block_ids"]
+    assert [block["id"] for block in ordered][1:2 + len(inserted_ids)] == [light_clock_id, *inserted_ids]
+    assert ordered[-1]["id"] == orbital_id
+
+
 def test_modify_replaces_one_block_in_place() -> None:
     canvas = client.get("/canvas").json()
     topic = next(item for item in canvas["artifacts"] if item["id"] != "artifact_no_notes")
@@ -156,11 +191,12 @@ def test_modify_replaces_one_block_in_place() -> None:
 
 
 def test_separate_topic_gets_new_region_and_topic_shift() -> None:
+    before = client.get("/canvas").json()
     result = interaction("Start a separate topic: plan a two-week Japan trip")
     assert '"mode": "new"' in result["text"]
     assert '"transition": "topic-shift"' in result["text"]
     canvas = client.get("/canvas").json()
-    assert len(canvas["artifacts"]) == 3
+    assert len(canvas["artifacts"]) == len(before["artifacts"]) + 1
     original = next(item for item in canvas["artifacts"] if item["id"] == "artifact_no_notes")
     created = next(item for item in canvas["artifacts"] if item["title"] == "Two weeks in Japan")
     assert created["title"] == "Two weeks in Japan"

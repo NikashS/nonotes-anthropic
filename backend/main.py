@@ -205,6 +205,18 @@ async def _interaction_stream(request: InteractionRequest) -> AsyncIterator[str]
             slots: list[tuple[OutlineBlock | OutlineUpdate, str, dict | None, bool]] = []
             focus_ids: list[str] = []
 
+            anchor = session.get(ArtifactBlock, outline.insert_after_block_id) if outline.insert_after_block_id else None
+            if anchor and anchor.artifact_id == artifact.id and outline.blocks:
+                next_order = anchor.order + 1
+                following = list(session.scalars(
+                    select(ArtifactBlock)
+                    .where(ArtifactBlock.artifact_id == artifact.id, ArtifactBlock.order >= next_order)
+                    .order_by(ArtifactBlock.order.desc())
+                ))
+                for existing in following:
+                    existing.order += len(outline.blocks)
+                session.flush()
+
             for update in outline.updates:
                 block = session.get(ArtifactBlock, update.block_id)
                 if not block or block.artifact_id != artifact.id:
@@ -232,7 +244,11 @@ async def _interaction_stream(request: InteractionRequest) -> AsyncIterator[str]
             region.height = max(region.height, 340 + total_blocks * 205 + size_adjustment)
             session.commit()
             mark("outline.persistence", stage_started)
-            yield event("outline.committed", {"artifact": serialize_artifact(artifact, region), "block_ids": focus_ids})
+            yield event("outline.committed", {
+                "artifact": serialize_artifact(artifact, region),
+                "block_ids": focus_ids,
+                "insert_after_block_id": anchor.id if anchor and anchor.artifact_id == artifact.id else None,
+            })
             yield event("viewport.focus_requested", {"artifact_id": artifact.id, "block_ids": focus_ids, "transition": transition})
 
             embedding_task = None

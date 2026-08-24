@@ -176,7 +176,9 @@ def _outline_from_plan(session: Session, plan: CanvasPlan) -> tuple[CanvasOutlin
         )
     return CanvasOutline(
         mode=plan.mode, title=plan.title, summary=plan.summary,
-        target_artifact_id=plan.target_artifact_id, layout=plan.layout,
+        target_artifact_id=plan.target_artifact_id,
+        insert_after_block_id=plan.insert_after_block_id,
+        layout=plan.layout,
         blocks=blocks, updates=updates,
     ), fallback_content
 
@@ -269,6 +271,51 @@ def _has_continuation_cue(query: str) -> bool:
     return any(re.search(pattern, query, re.IGNORECASE) for pattern in patterns)
 
 
+_ANCHOR_STOP_WORDS = {
+    "about", "after", "again", "also", "and", "are", "can", "could", "did", "does", "for",
+    "from", "have", "how", "into", "more", "that", "the", "their", "this", "what", "when",
+    "where", "which", "who", "with", "would", "you", "your",
+}
+
+
+def _anchor_terms(value: str) -> set[str]:
+    return {
+        word for word in re.findall(r"[a-z0-9]+", value.lower())
+        if len(word) > 2 and word not in _ANCHOR_STOP_WORDS
+    }
+
+
+def _select_anchor_block(query: str, blocks: list[ArtifactBlock], focused_block_ids: list[str]) -> ArtifactBlock | None:
+    """Pick the section a follow-up is actually about, without another model call."""
+    query_terms = _anchor_terms(query)
+    focused = set(focused_block_ids)
+    best: ArtifactBlock | None = None
+    best_score = 0.0
+
+    for block in blocks:
+        content = block.content or {}
+        title_terms = _anchor_terms(f"{content.get('eyebrow', '')} {content.get('title', '')}")
+        body_terms = _anchor_terms(str(content.get("body", "")))
+        item_terms: set[str] = set()
+        for item in content.get("items", []):
+            if isinstance(item, dict):
+                item_terms |= _anchor_terms(f"{item.get('label', '')} {item.get('title', '')} {item.get('body', '')}")
+
+        score = (
+            len(query_terms & title_terms) * 3.0
+            + len(query_terms & body_terms)
+            + len(query_terms & item_terms) * 1.25
+            + (0.75 if block.id in focused else 0.0)
+        )
+        if score > best_score or (score == best_score and best is not None and block.order > best.order):
+            best = block
+            best_score = score
+
+    if best_score > 0:
+        return best
+    return next((block for block in blocks if block.id in focused), None)
+
+
 def _semantic_plan(session: Session, request: InteractionRequest, retrieval: dict) -> CanvasPlan:
     """Create a fast spatial contract from vector retrieval and explicit intent.
 
@@ -331,6 +378,10 @@ def _semantic_plan(session: Session, request: InteractionRequest, retrieval: dic
             )
 
     mode = "extend" if target else "new"
+    target_blocks = list(session.scalars(
+        select(ArtifactBlock).where(ArtifactBlock.artifact_id == target.id).order_by(ArtifactBlock.order)
+    )) if target else []
+    anchor = _select_anchor_block(query, target_blocks, request.context.focused_block_ids)
     title = target.title if target else _title_from_query(query)
     if not target and "japan" in lower and any(word in lower for word in ("trip", "travel", "itinerary")):
         if "ten" in lower or "10" in lower:
@@ -401,6 +452,7 @@ def _semantic_plan(session: Session, request: InteractionRequest, retrieval: dic
     return CanvasPlan(
         mode=mode,
         target_artifact_id=target.id if target else None,
+        insert_after_block_id=anchor.id if anchor else None,
         title=title,
         summary=summary,
         layout="editorial",

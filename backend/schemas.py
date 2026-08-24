@@ -69,6 +69,7 @@ class CanvasOutline(BaseModel):
     title: str
     summary: str
     target_artifact_id: str | None = None
+    insert_after_block_id: str | None = None
     layout: Literal["editorial", "board", "report"] = "editorial"
     updates: list[OutlineUpdate] = Field(default_factory=list)
     blocks: list[OutlineBlock] = Field(default_factory=list)
@@ -97,6 +98,7 @@ class CanvasPlan(BaseModel):
     title: str
     summary: str
     target_artifact_id: str | None = None
+    insert_after_block_id: str | None = None
     layout: Literal["editorial", "board", "report"] = "editorial"
     updates: list[PlanUpdate] = Field(default_factory=list)
     blocks: list[PlanBlock] = Field(default_factory=list)

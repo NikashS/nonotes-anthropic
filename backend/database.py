@@ -11,7 +11,6 @@ import re
 
 from sqlalchemy import JSON, DateTime, Float, ForeignKey, Index, Integer, String, Text, create_engine, select, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column
-from sqlalchemy.pool import NullPool
 
 load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
@@ -114,10 +113,21 @@ elif database_url.startswith("postgresql://"):
 if database_url.startswith("sqlite"):
     engine = create_engine(database_url, pool_pre_ping=True, connect_args={"check_same_thread": False})
 else:
-    # Vercel instances are transient. Let Supavisor own connection pooling and
-    # disable prepared statements, which transaction-pooling mode cannot retain.
-    connect_args = {"prepare_threshold": None} if ":6543/" in database_url else {}
-    engine = create_engine(database_url, pool_pre_ping=True, poolclass=NullPool, connect_args=connect_args)
+    # Supavisor owns database-side pooling. A tiny client pool avoids repeating
+    # DNS + TLS setup for every Session in a warm Vercel instance while keeping
+    # the number of serverless client connections tightly bounded.
+    connect_args = {"connect_timeout": 3}
+    if ":6543/" in database_url:
+        connect_args["prepare_threshold"] = None
+    engine = create_engine(
+        database_url,
+        pool_pre_ping=True,
+        pool_size=2,
+        max_overflow=1,
+        pool_timeout=4,
+        pool_recycle=300,
+        connect_args=connect_args,
+    )
 
 
 def serialize_region(region: ArtifactRegion) -> dict:

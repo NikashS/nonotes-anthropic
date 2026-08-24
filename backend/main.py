@@ -158,16 +158,16 @@ async def _interaction_stream(request: InteractionRequest) -> AsyncIterator[str]
         seq += 1
         return json.dumps({"event": name, "seq": seq, "run_id": run_id, "payload": payload}, default=str) + "\n"
 
-    stage_started = time.perf_counter()
-    with Session(engine) as session:
-        session.add(InteractionRun(id=run_id, canvas_id=request.context.canvas_id, message=request.message, focused_artifact_id=request.context.focused_artifact_id, context=request.context.model_dump()))
-        session.commit()
-
     yield event("run.started", {"message": request.message})
-    yield event("latency.stage", {"stage": "run.persistence", "duration_ms": mark("run.persistence", stage_started)})
-    yield event("context.selected", {"label": "Sketching the shape of this"})
 
     try:
+        stage_started = time.perf_counter()
+        with Session(engine) as session:
+            session.add(InteractionRun(id=run_id, canvas_id=request.context.canvas_id, message=request.message, focused_artifact_id=request.context.focused_artifact_id, context=request.context.model_dump()))
+            session.commit()
+        yield event("latency.stage", {"stage": "run.persistence", "duration_ms": mark("run.persistence", stage_started)})
+        yield event("context.selected", {"label": "Sketching the shape of this"})
+
         with Session(engine) as session:
             stage_started = time.perf_counter()
             outline, planner, fallbacks, retrieval = await make_outline(session, request)
@@ -297,10 +297,13 @@ async def _interaction_stream(request: InteractionRequest) -> AsyncIterator[str]
             "level": "error", "message": "latency.failed", "run_id": run_id,
             "error": type(exc).__name__, "timings": timings,
         }))
-        with Session(engine) as session:
-            run = session.get(InteractionRun, run_id)
-            if run:
-                run.status = "failed"
-                run.completed_at = utcnow()
-                session.commit()
+        try:
+            with Session(engine) as session:
+                run = session.get(InteractionRun, run_id)
+                if run:
+                    run.status = "failed"
+                    run.completed_at = utcnow()
+                    session.commit()
+        except Exception:
+            logger.exception(json.dumps({"level": "error", "message": "run.failure_persistence_failed", "run_id": run_id}))
         yield event("run.failed", {"message": "The response could not be completed. Please try again.", "detail": type(exc).__name__})

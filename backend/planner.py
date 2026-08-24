@@ -258,7 +258,7 @@ For diagrams and processes, each item is a node or step. For comparisons, each i
         ],
     }, ensure_ascii=False)
     try:
-        raw = await _call_tool(system, CONTENT_TOOL, prompt, min(1800, 420 + len(slots) * 340), 22)
+        raw = await _call_tool(system, CONTENT_TOOL, prompt, min(1800, 420 + len(slots) * 340), 30)
         batch = GeneratedBlockBatch.model_validate(raw)
         generated = {item.ref: item.content for item in batch.blocks}
     except (httpx.HTTPError, TimeoutError, ValueError) as exc:

@@ -333,4 +333,8 @@ def init_database() -> None:
             session.commit()
 
 
-init_database()
+# Local SQLite needs convenient bootstrapping. Production Postgres is managed
+# by migrations; running DDL and seed reconciliation in every new Vercel
+# function instance adds avoidable cold-start work before the first request.
+if not os.getenv("VERCEL"):
+    init_database()

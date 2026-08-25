@@ -36,6 +36,12 @@ CONTENT_TOOL = {
 
 logger = logging.getLogger(__name__)
 
+# Calibrated against generated query-to-artifact comparisons. Full-topic
+# matches started at 0.8332; cross-topic matches topped out at 0.8187.
+SEMANTIC_CONTINUITY_THRESHOLD = 0.825
+HYBRID_CONTINUITY_THRESHOLD = 0.30
+LEXICAL_CONTINUITY_THRESHOLD = 0.18
+
 
 def _log_timing(stage: str, started: float, **details: object) -> None:
     logger.info(json.dumps({
@@ -343,9 +349,9 @@ def _semantic_plan(session: Session, request: InteractionRequest, retrieval: dic
     best = candidates[0] if candidates else None
     best_scores = (best or {}).get("retrieval", {})
     strong_match = bool(best and (
-        float(best_scores.get("semantic", 0)) >= 0.76
-        or float(best_scores.get("score", 0)) >= 0.18
-        or float(best_scores.get("lexical", 0)) >= 0.18
+        float(best_scores.get("semantic", 0)) >= SEMANTIC_CONTINUITY_THRESHOLD
+        or float(best_scores.get("score", 0)) >= HYBRID_CONTINUITY_THRESHOLD
+        or float(best_scores.get("lexical", 0)) >= LEXICAL_CONTINUITY_THRESHOLD
     ))
 
     explicit_new = any(phrase in lower for phrase in (

@@ -258,6 +258,60 @@ def test_named_topic_can_bootstrap_an_artifact_with_a_missing_vector() -> None:
     assert plan.target_artifact_id == physics_id
 
 
+def test_cross_topic_embedding_baseline_starts_a_new_region() -> None:
+    physics_id = f"artifact_threshold_{uuid4().hex[:8]}"
+    request = InteractionRequest.model_validate({
+        "message": "Visualize when a relational database beats a document or graph database",
+        "context": {"focused_artifact_id": physics_id},
+    })
+    retrieval = {
+        "artifacts": [{
+            "id": physics_id,
+            "kind": "composition",
+            "retrieval": {"score": 0.1446, "semantic": 0.7603, "lexical": 0.0},
+        }],
+    }
+    with Session(engine) as session:
+        session.add(Artifact(
+            id=physics_id,
+            canvas_id="main",
+            title="Why Time Slows Near the Speed of Light",
+            summary="Special relativity and the light-clock thought experiment",
+        ))
+        session.flush()
+        plan = _semantic_plan(session, request, retrieval)
+
+    assert plan.mode == "new"
+    assert plan.target_artifact_id is None
+
+
+def test_high_confidence_semantic_match_extends_existing_region() -> None:
+    physics_id = f"artifact_semantic_{uuid4().hex[:8]}"
+    request = InteractionRequest.model_validate({
+        "message": "Explain the twin paradox visually",
+        "context": {},
+    })
+    retrieval = {
+        "artifacts": [{
+            "id": physics_id,
+            "kind": "composition",
+            "retrieval": {"score": 0.3197, "semantic": 0.8332, "lexical": 0.0},
+        }],
+    }
+    with Session(engine) as session:
+        session.add(Artifact(
+            id=physics_id,
+            canvas_id="main",
+            title="Why Time Slows Near the Speed of Light",
+            summary="Special relativity and the light-clock thought experiment",
+        ))
+        session.flush()
+        plan = _semantic_plan(session, request, retrieval)
+
+    assert plan.mode == "extend"
+    assert plan.target_artifact_id == physics_id
+
+
 def test_modify_replaces_one_block_in_place() -> None:
     canvas = client.get("/canvas").json()
     topic = next(item for item in canvas["artifacts"] if item["id"] != "artifact_no_notes")

@@ -13,7 +13,7 @@ os.environ["DATABASE_URL"] = f"sqlite:////tmp/nonotes-test-{uuid4().hex}.db"
 from backend.database import Artifact, ArtifactBlock, ArtifactRegion, engine
 from backend.main import _compile_fragments, app
 from backend import planner
-from backend.planner import _validate_plan_input
+from backend.planner import _semantic_plan, _validate_plan_input
 from backend.schemas import BlockItem, InteractionRequest, OutlineBlock
 
 client = TestClient(app)
@@ -177,6 +177,57 @@ def test_related_follow_up_is_inserted_after_the_relevant_block() -> None:
     inserted_ids = committed["payload"]["block_ids"]
     assert [block["id"] for block in ordered][1:2 + len(inserted_ids)] == [light_clock_id, *inserted_ids]
     assert ordered[-1]["id"] == orbital_id
+
+
+def test_named_topic_beats_unrelated_focused_artifact() -> None:
+    physics_id = f"artifact_physics_{uuid4().hex[:8]}"
+    travel_id = f"artifact_portugal_{uuid4().hex[:8]}"
+    portugal_block_id = f"block_portugal_{uuid4().hex[:8]}"
+    request = InteractionRequest.model_validate({
+        "message": "Add Nazaré to the Portugal plan",
+        "context": {"focused_artifact_id": physics_id},
+    })
+    retrieval = {
+        "artifacts": [
+            {"id": travel_id, "kind": "composition", "retrieval": {"score": 0.72, "semantic": 0.8, "lexical": 0.22}},
+            {"id": physics_id, "kind": "composition", "retrieval": {"score": 0.12, "semantic": 0.08, "lexical": 0.0}},
+        ],
+    }
+    with Session(engine) as session:
+        session.add_all([
+            Artifact(id=physics_id, canvas_id="main", title="Time Dilation", summary="Special relativity"),
+            Artifact(id=travel_id, canvas_id="main", title="Portugal at a Gentle Pace", summary="A Portugal itinerary"),
+            ArtifactBlock(id=f"block_physics_{uuid4().hex[:8]}", artifact_id=physics_id, kind="hero", order=0, content={"title": "Time Dilation"}),
+            ArtifactBlock(id=portugal_block_id, artifact_id=travel_id, kind="hero", order=0, content={"title": "Portugal at a Gentle Pace"}),
+        ])
+        session.flush()
+        plan = _semantic_plan(session, request, retrieval)
+
+    assert plan.mode == "extend"
+    assert plan.target_artifact_id == travel_id
+    assert plan.insert_after_block_id == portugal_block_id
+
+
+def test_unrelated_focus_does_not_create_a_continuation() -> None:
+    physics_id = f"artifact_focus_{uuid4().hex[:8]}"
+    request = InteractionRequest.model_validate({
+        "message": "Explain how sourdough fermentation works",
+        "context": {"focused_artifact_id": physics_id},
+    })
+    retrieval = {
+        "artifacts": [{
+            "id": physics_id,
+            "kind": "composition",
+            "retrieval": {"score": 0.08, "semantic": 0.09, "lexical": 0.0},
+        }],
+    }
+    with Session(engine) as session:
+        session.add(Artifact(id=physics_id, canvas_id="main", title="Time Dilation", summary="Special relativity"))
+        session.flush()
+        plan = _semantic_plan(session, request, retrieval)
+
+    assert plan.mode == "new"
+    assert plan.target_artifact_id is None
 
 
 def test_modify_replaces_one_block_in_place() -> None:

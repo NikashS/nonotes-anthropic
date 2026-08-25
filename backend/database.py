@@ -232,6 +232,7 @@ def retrieve_artifacts(
     embedding: list[float] | None = None,
     limit: int = 6,
 ) -> list[RetrievedArtifact]:
+    del focused_artifact_id  # Focus is context for ambiguous language, never a routing score.
     artifacts = list(session.scalars(select(Artifact).where(Artifact.canvas_id == canvas_id)))
     semantic_scores: dict[str, float] = {}
     if embedding and session.bind and session.bind.dialect.name == "postgresql":
@@ -252,9 +253,8 @@ def retrieve_artifacts(
         overlap = len(query_terms & artifact_terms)
         lexical = overlap / max(1, len(query_terms | artifact_terms))
         semantic = semantic_scores.get(artifact.id, 0.0)
-        focus = 0.07 if artifact.id == focused_artifact_id and artifact.kind != "welcome" else 0.0
-        # Semantics dominate; lexical overlap and focus break close calls.
-        score = semantic * 0.82 + lexical * 0.13 + focus
+        focus = 0.0
+        score = semantic * 0.86 + lexical * 0.14
         if artifact.kind == "welcome":
             score = -1
         candidates.append(RetrievedArtifact(artifact, semantic, lexical, focus, score))

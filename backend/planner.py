@@ -48,14 +48,29 @@ def _log_timing(stage: str, started: float, **details: object) -> None:
 
 
 async def _compact_context(session: Session, request: InteractionRequest) -> dict:
+    retrieval_query = request.message
+    if _has_deictic_reference(request.message) and request.context.focused_artifact_id:
+        focused = session.get(Artifact, request.context.focused_artifact_id)
+        if focused and focused.kind != "welcome":
+            focused_blocks = [
+                session.get(ArtifactBlock, block_id)
+                for block_id in request.context.focused_block_ids
+            ]
+            focus_text = [focused.title, focused.summary]
+            for block in focused_blocks:
+                if block and block.artifact_id == focused.id:
+                    content = block.content or {}
+                    focus_text.extend([str(content.get("title", "")), str(content.get("body", ""))])
+            retrieval_query = f"{request.message}\nContext referred to: " + "\n".join(part for part in focus_text if part)
+
     embedding = None
     if session.bind and session.bind.dialect.name == "postgresql":
         started = time.perf_counter()
-        embedding = await generate_embedding(request.message)
+        embedding = await generate_embedding(retrieval_query)
         _log_timing("retrieval.embedding", started, available=bool(embedding))
     started = time.perf_counter()
     candidates = retrieve_artifacts(
-        session, request.context.canvas_id, request.message,
+        session, request.context.canvas_id, retrieval_query,
         request.context.focused_artifact_id, embedding,
     )
     _log_timing("retrieval.database", started, candidate_count=len(candidates))
@@ -78,7 +93,8 @@ async def _compact_context(session: Session, request: InteractionRequest) -> dic
             "blocks": [{"id": block.id, "kind": block.kind, "content": block.content} for block in blocks],
         })
     return {
-        "retrieval_method": "semantic_hybrid" if embedding else "lexical_focus_fallback",
+        "retrieval_method": "semantic_hybrid" if embedding else "lexical_fallback",
+        "retrieval_query": retrieval_query,
         "artifacts": result,
         "focused_block_ids": request.context.focused_block_ids,
     }
@@ -261,14 +277,12 @@ def _title_from_query(query: str) -> str:
     return title[0].upper() + title[1:]
 
 
-def _has_continuation_cue(query: str) -> bool:
-    patterns = (
-        r"\b(this|that|it|these|those)\b",
-        r"\b(add|append|include|expand|extend|continue|revise|rewrite|simplify|shorten|change|rename)\b",
-        r"\b(go deeper|more on|build on|what about|turn this|visualize this|make this|make it)\b",
-        r"^(and|also|but)\b",
+def _has_deictic_reference(query: str) -> bool:
+    """True when the user explicitly points at the currently focused work."""
+    return bool(
+        re.search(r"\b(this|that|it|these|those)\b", query, re.IGNORECASE)
+        or re.search(r"^(and|also|but)\b", query, re.IGNORECASE)
     )
-    return any(re.search(pattern, query, re.IGNORECASE) for pattern in patterns)
 
 
 _ANCHOR_STOP_WORDS = {
@@ -325,10 +339,6 @@ def _semantic_plan(session: Session, request: InteractionRequest, retrieval: dic
     """
     query = request.message.strip()
     lower = query.lower()
-    focused = session.get(Artifact, request.context.focused_artifact_id) if request.context.focused_artifact_id else None
-    if focused and focused.kind == "welcome":
-        focused = None
-
     candidates = [item for item in retrieval.get("artifacts", []) if item.get("kind") != "welcome"]
     best = candidates[0] if candidates else None
     best_scores = (best or {}).get("retrieval", {})
@@ -347,11 +357,8 @@ def _semantic_plan(session: Session, request: InteractionRequest, retrieval: dic
     navigate = any(word in lower for word in ("take me to", "go to", "show me where", "where is"))
 
     target = None
-    if not explicit_new:
-        if focused and _has_continuation_cue(query):
-            target = focused
-        elif strong_match:
-            target = session.get(Artifact, best["id"])
+    if not explicit_new and strong_match:
+        target = session.get(Artifact, best["id"])
 
     if navigate and target:
         return CanvasPlan(mode="navigate", target_artifact_id=target.id, title=target.title, summary=target.summary)

@@ -132,12 +132,15 @@ def test_first_question_leaves_welcome_and_uses_a_new_region() -> None:
 def test_follow_up_stream_extends_focused_artifact() -> None:
     canvas = client.get("/canvas").json()
     topic = next(item for item in canvas["artifacts"] if item["id"] != "artifact_no_notes")
+    durable_summary = topic["summary"]
     topic_blocks_before = [block for block in canvas["blocks"] if block["artifact_id"] == topic["id"]]
     result = interaction("Add a privacy layer to this", topic["id"], [topic_blocks_before[0]["id"]])
     assert any('"event": "block.started"' in line for line in result["events"])
     assert any('"mode": "extend"' in line for line in result["events"])
     assert any('"transition": "continuation"' in line for line in result["events"])
     canvas = client.get("/canvas").json()
+    updated_topic = next(item for item in canvas["artifacts"] if item["id"] == topic["id"])
+    assert updated_topic["summary"] == durable_summary
     assert len([block for block in canvas["blocks"] if block["artifact_id"] == topic["id"]]) > len(topic_blocks_before)
     assert len([block for block in canvas["blocks"] if block["artifact_id"] == "artifact_no_notes"]) == 4
 

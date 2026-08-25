@@ -193,7 +193,8 @@ async def _interaction_stream(request: InteractionRequest) -> AsyncIterator[str]
                     session.add(region)
                 if outline.mode == "modify" and outline.title:
                     artifact.title = outline.title
-                artifact.summary = outline.summary or artifact.summary
+                # The summary describes the durable topic. A follow-up's answer
+                # must not replace that identity with the latest prompt.
                 artifact.updated_at = utcnow()
             session.flush()
 
@@ -258,7 +259,11 @@ async def _interaction_stream(request: InteractionRequest) -> AsyncIterator[str]
 
             embedding_task = None
             if session.bind and session.bind.dialect.name == "postgresql" and outline.mode != "navigate":
-                embedding_source = f"{artifact.title}\n{artifact.summary}\n{request.message}"
+                # Embed the artifact that retrieval will actually return. The
+                # previous implementation embedded only the latest prompt while
+                # storing the full artifact as embedding_text, which let one
+                # cross-topic mistake contaminate future routing.
+                embedding_source = f"{artifact_embedding_text(session, artifact)}\n{request.message}"
                 embedding_task = asyncio.create_task(generate_embedding(embedding_source))
 
             stage_started = time.perf_counter()

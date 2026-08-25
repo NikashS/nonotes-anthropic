@@ -225,7 +225,8 @@ async def fill_outline_blocks(
         return {slot.ref: fallbacks[slot.ref] for slot, _ in slots if slot.ref in fallbacks}
     system = """You write every section of one hand-drawn visual explanation in a single pass. Respect each predefined block kind, reference, and footprint exactly.
 Return one result for every supplied ref and no others, in the same order. Return the requested number of items so the layout does not shift. Make the sections complementary rather than repetitive. Be concrete, explanatory, and concise. Avoid generic introductions and UI language.
-For diagrams and processes, each item is a node or step. For comparisons, each item is a meaningful dimension or option. For timelines, each item is a stage. Body text should usually stay under 80 words and item bodies under 24 words."""
+Every diagram, process, comparison, timeline, or metrics block is a visual teaching surface: make its labels specific to the request and make the relationships understandable without relying on adjacent prose. For diagrams and processes, each item is a node or step. For comparisons, each item is a meaningful dimension or option. For timelines, each item is a stage.
+Use plain text only inside fields: never emit Markdown markers such as **, _, backticks, headings, or list prefixes. Body text should usually stay under 80 words and item bodies under 24 words."""
     def prompt_for(selected: list[tuple[OutlineBlock | OutlineUpdate, dict | None]]) -> str:
         return json.dumps({
             "request": request.message,
@@ -416,15 +417,27 @@ def _semantic_plan(session: Session, request: InteractionRequest, retrieval: dic
             PlanBlock(ref="database_rule", kind="callout", title="Default deliberately", body="Start with PostgreSQL unless a concrete constraint points elsewhere.", variant="accent"),
         ]
         summary = f"A practical database decision guide prompted by: {query}"
-    elif any(word in lower for word in ("physics", "relativity", "speed of light", "gravity", "quantum", "time slows")):
+    elif any(word in lower for word in (
+        "physics", "relativity", "speed of light", "gravity", "quantum", "time slows",
+        "newton", "motion", "force", "momentum", "acceleration", "inertia", "energy",
+        "thermodynamics", "electricity", "magnetism", "wave", "orbit",
+    )):
+        is_newtonian = any(word in lower for word in ("newton", "laws of motion", "inertia", "f = ma"))
+        visual_kind = "comparison" if is_newtonian else "diagram"
+        visual_title = "Three laws, three questions" if is_newtonian else "The mechanism at a glance"
+        visual_items = [
+            BlockItem(label="Law 1", title="What keeps moving?", body="Without a net force, velocity stays unchanged."),
+            BlockItem(label="Law 2", title="What changes motion?", body="Net force produces acceleration: F = ma."),
+            BlockItem(label="Law 3", title="Where is the pair?", body="Every force has an equal, opposite partner."),
+        ] if is_newtonian else [
+            BlockItem(title="Starting state", body="Establish the system and what is being measured."),
+            BlockItem(title="Physical interaction", body="Identify the mechanism that changes the system."),
+            BlockItem(title="Governing constraint", body="Apply the quantity or relationship that stays consistent."),
+            BlockItem(title="Observable result", body="Connect the mechanism to what an observer measures."),
+        ]
         blocks = [
             PlanBlock(ref="physics_idea", kind="hero", title=_title_from_query(query), body="A visual explanation grounded in the physical intuition first, then the governing relationship.", variant="plain"),
-            PlanBlock(ref="physics_visual", kind="diagram", title="What changes between observers", variant="sketch", items=[
-                BlockItem(title="Observer", body="Measures events with a clock and ruler."),
-                BlockItem(title="Relative motion", body="Changes how space and time divide the interval."),
-                BlockItem(title="Invariant", body="The speed of light stays the same."),
-                BlockItem(title="Consequence", body="Elapsed time differs between paths."),
-            ]),
+            PlanBlock(ref="physics_visual", kind=visual_kind, title=visual_title, variant="sketch", items=visual_items),
             PlanBlock(ref="physics_detail", kind="rich_text", title="The useful intuition", body="The model will connect the diagram to the precise explanation.", variant="quiet"),
         ]
         summary = f"A visual physics explanation prompted by: {query}"
@@ -455,7 +468,11 @@ def _semantic_plan(session: Session, request: InteractionRequest, retrieval: dic
     else:
         blocks = [
             PlanBlock(ref="answer", kind="hero", title=_title_from_query(query), body=f"A focused visual answer to: {query}", variant="plain"),
-            PlanBlock(ref="explanation", kind="rich_text", title="The core idea", body="The answer starts with the essential idea, then adds the detail needed to use it.", variant="plain"),
+            PlanBlock(ref="explanation", kind="diagram", title="How the ideas connect", body="Read this as a visual map of the answer.", variant="sketch", items=[
+                BlockItem(title="Starting point", body="The premise or input that frames the question."),
+                BlockItem(title="Core mechanism", body="The relationship that explains what happens."),
+                BlockItem(title="Result", body="The consequence that follows from the mechanism."),
+            ]),
             PlanBlock(ref="takeaways", kind="list", title="What to remember", variant="sketch", items=[
                 BlockItem(title="Core principle"), BlockItem(title="Important tradeoff"), BlockItem(title="Practical next step"),
             ]),

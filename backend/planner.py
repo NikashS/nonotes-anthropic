@@ -343,8 +343,8 @@ def _semantic_plan(session: Session, request: InteractionRequest, retrieval: dic
     best = candidates[0] if candidates else None
     best_scores = (best or {}).get("retrieval", {})
     strong_match = bool(best and (
-        float(best_scores.get("semantic", 0)) >= 0.52
-        or float(best_scores.get("score", 0)) >= 0.48
+        float(best_scores.get("semantic", 0)) >= 0.76
+        or float(best_scores.get("score", 0)) >= 0.18
         or float(best_scores.get("lexical", 0)) >= 0.18
     ))
 

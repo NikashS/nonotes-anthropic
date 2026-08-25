@@ -233,6 +233,31 @@ def test_unrelated_focus_does_not_create_a_continuation() -> None:
     assert plan.target_artifact_id is None
 
 
+def test_named_topic_can_bootstrap_an_artifact_with_a_missing_vector() -> None:
+    physics_id = f"artifact_vectorless_{uuid4().hex[:8]}"
+    unrelated_id = f"artifact_unrelated_{uuid4().hex[:8]}"
+    request = InteractionRequest.model_validate({
+        "message": "Compare special relativity time dilation evidence from atomic clocks and muons",
+        "context": {"focused_artifact_id": unrelated_id},
+    })
+    retrieval = {
+        "artifacts": [
+            {"id": physics_id, "kind": "composition", "retrieval": {"score": 0.28, "semantic": 0.0, "lexical": 0.21}},
+            {"id": unrelated_id, "kind": "composition", "retrieval": {"score": 0.15, "semantic": 0.76, "lexical": 0.0}},
+        ],
+    }
+    with Session(engine) as session:
+        session.add_all([
+            Artifact(id=physics_id, canvas_id="main", title="Time Dilation", summary="Special relativity and experimental evidence"),
+            Artifact(id=unrelated_id, canvas_id="main", title="Redis", summary="An in-memory database"),
+        ])
+        session.flush()
+        plan = _semantic_plan(session, request, retrieval)
+
+    assert plan.mode == "extend"
+    assert plan.target_artifact_id == physics_id
+
+
 def test_modify_replaces_one_block_in_place() -> None:
     canvas = client.get("/canvas").json()
     topic = next(item for item in canvas["artifacts"] if item["id"] != "artifact_no_notes")

@@ -254,7 +254,12 @@ def retrieve_artifacts(
         lexical = overlap / max(1, len(query_terms | artifact_terms))
         semantic = semantic_scores.get(artifact.id, 0.0)
         focus = 0.0
-        score = semantic * 0.86 + lexical * 0.14
+        # gte-small cosine similarities have a high baseline in this corpus:
+        # unrelated artifacts commonly land around 0.70. Calibrate that away
+        # before blending, while retaining lexical signal for named topics and
+        # artifacts whose vector is missing or being regenerated.
+        semantic_signal = max(0.0, (semantic - 0.70) / 0.30)
+        score = semantic_signal * 0.72 + lexical * 1.35
         if artifact.kind == "welcome":
             score = -1
         candidates.append(RetrievedArtifact(artifact, semantic, lexical, focus, score))

@@ -113,6 +113,31 @@ def test_provisional_sql_outline_does_not_wait_for_a_model(monkeypatch) -> None:
     assert all("No Notes stores outcomes" not in block.body for block in fallbacks.values())
 
 
+def test_explanations_always_reserve_a_visual_block() -> None:
+    for message in (
+        "Explain Newton's three laws of motion",
+        "Why do leaves change color?",
+        "Describe how a bill becomes law",
+    ):
+        with Session(engine) as session:
+            plan = _semantic_plan(session, InteractionRequest(message=message), {"artifacts": []})
+        assert any(block.kind in {"diagram", "process", "comparison", "timeline", "metrics"} for block in plan.blocks)
+
+    with Session(engine) as session:
+        newton = _semantic_plan(
+            session, InteractionRequest(message="Explain Newton's three laws of motion"), {"artifacts": []},
+        )
+    visual = next(block for block in newton.blocks if block.kind == "comparison")
+    assert [item.label for item in visual.items] == ["Law 1", "Law 2", "Law 3"]
+
+
+def test_renderer_removes_unsupported_markdown_markers() -> None:
+    html = "".join(_compile_fragments("rich_text", "Core", "", "**Law 1:** use `F = ma`", []))
+    assert "**" not in html
+    assert "`" not in html
+    assert "Law 1:" in html
+
+
 def test_first_question_leaves_welcome_and_uses_a_new_region() -> None:
     before = client.get("/canvas").json()
     result = interaction("Explain how privacy should work in an AI memory system")

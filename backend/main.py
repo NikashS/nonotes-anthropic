@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import time
 from collections.abc import AsyncIterator
 from html import escape
@@ -55,13 +56,18 @@ def get_canvas(canvas_id: str = "main") -> dict:
 
 
 def _item_html(item: BlockItem, tag: str = "article") -> str:
-    label = f'<small>{escape(item.label)}</small>' if item.label else ""
-    body = f'<p>{escape(item.body)}</p>' if item.body else ""
-    return f'<{tag}>{label}<strong>{escape(item.title)}</strong>{body}</{tag}>'
+    label = f'<small>{_safe_text(item.label)}</small>' if item.label else ""
+    body = f'<p>{_safe_text(item.body)}</p>' if item.body else ""
+    return f'<{tag}>{label}<strong>{_safe_text(item.title)}</strong>{body}</{tag}>'
+
+
+def _safe_text(value: str) -> str:
+    """Escape model text and remove presentation syntax unsupported by blocks."""
+    return escape(re.sub(r"(?:\*\*|__|`)", "", value))
 
 
 def _compile_fragments(kind: str, title: str, eyebrow: str, body: str, items: list[BlockItem]) -> list[str]:
-    safe_title, safe_eyebrow, safe_body = escape(title), escape(eyebrow), escape(body)
+    safe_title, safe_eyebrow, safe_body = _safe_text(title), _safe_text(eyebrow), _safe_text(body)
     if kind == "hero":
         return [
             f'<p class="eyebrow">{safe_eyebrow}</p>' if eyebrow else "",
@@ -78,13 +84,13 @@ def _compile_fragments(kind: str, title: str, eyebrow: str, body: str, items: li
     if kind == "timeline":
         return [f"<h2>{safe_title}</h2>" if title else "", '<ol class="timeline">' + "".join(_item_html(item, "li") for item in items) + "</ol>"]
     if kind == "diagram":
-        nodes = "".join(f'<article><b>{index + 1}</b><strong>{escape(item.title)}</strong><p>{escape(item.body)}</p></article>' for index, item in enumerate(items))
+        nodes = "".join(f'<article><b>{index + 1}</b><strong>{_safe_text(item.title)}</strong><p>{_safe_text(item.body)}</p></article>' for index, item in enumerate(items))
         return [f"<h2>{safe_title}</h2>" if title else "", f'<p class="diagram-intro">{safe_body}</p>' if body else "", f'<div class="diagram-flow" data-count="{len(items)}">{nodes}</div>']
     if kind == "callout":
         return [f'<span class="scribble">{safe_title}</span>' if title else "", f"<p>{safe_body}</p>" if body else ""]
     if kind == "metrics":
         return [f"<h2>{safe_title}</h2>" if title else "", '<div class="metrics-grid">' + "".join(_item_html(item) for item in items) + "</div>"]
-    return [f"<h2>{safe_title}</h2>" if title else "", f"<p>{safe_body}</p>" if body else "", "<ul>" + "".join(f"<li>{escape(item.title)}</li>" for item in items) + "</ul>" if items else ""]
+    return [f"<h2>{safe_title}</h2>" if title else "", f"<p>{safe_body}</p>" if body else "", "<ul>" + "".join(f"<li>{_safe_text(item.title)}</li>" for item in items) + "</ul>" if items else ""]
 
 
 def _content(block: PlanBlock) -> dict:
